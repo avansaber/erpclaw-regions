@@ -2,8 +2,8 @@
 name: erpclaw-region-eu
 version: 1.0.0
 description: EU regional compliance — VAT (27 member states), reverse charge, OSS, Intrastat, EN 16931 e-invoicing, SAF-T, EC Sales List, IBAN validation, EORI, VIES format, withholding tax, and European CoA template for ERPClaw ERP
-author: AvanSaber / Nikhil Jathar
-homepage: https://www.erpclaw.ai
+author: AvanSaber
+homepage: https://github.com/avansaber/erpclaw-regions
 source: https://github.com/avansaber/erpclaw-regions
 tier: 3
 category: regional

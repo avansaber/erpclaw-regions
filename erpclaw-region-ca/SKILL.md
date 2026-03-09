@@ -2,8 +2,8 @@
 name: erpclaw-region-ca
 version: 1.0.0
 description: Canada regional compliance — GST/HST/PST/QST, CPP/CPP2/QPP/EI, federal+provincial income tax, T4/T4A/ROE/PD7A, Canadian CoA (ASPE), and ID validation (BN/SIN) for ERPClaw ERP
-author: AvanSaber / Nikhil Jathar
-homepage: https://www.erpclaw.ai
+author: AvanSaber
+homepage: https://github.com/avansaber/erpclaw-regions
 source: https://github.com/avansaber/erpclaw-regions
 tier: 3
 category: regional
