@@ -4,7 +4,7 @@ version: 1.0.0
 description: India regional compliance — GST (post GST 2.0), e-invoicing, GSTR-1/3B, TDS, Indian CoA (Ind-AS), PF/ESI/PT payroll deductions, and ID validation for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-region-in
+source: https://github.com/avansaber/erpclaw-regions
 tier: 3
 category: regional
 requires: [erpclaw]

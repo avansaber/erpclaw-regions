@@ -4,7 +4,7 @@ version: 1.0.0
 description: UK regional compliance — VAT (standard/reduced/zero/flat rate), PAYE, NI, student loan, pension (NEST), RTI (FPS/EPS/P60/P45), CIS, FRS 102 CoA, and ID validation (VAT number/UTR/NINO/CRN) for ERPClaw ERP
 author: AvanSaber / Nikhil Jathar
 homepage: https://www.erpclaw.ai
-source: https://github.com/avansaber/erpclaw/tree/main/skills/erpclaw-region-uk
+source: https://github.com/avansaber/erpclaw-regions
 tier: 3
 category: regional
 requires: [erpclaw]
