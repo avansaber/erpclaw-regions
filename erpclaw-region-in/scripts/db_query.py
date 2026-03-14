@@ -32,6 +32,7 @@ try:
     from erpclaw_lib.dependencies import check_required_tables
     from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
+    from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw first: clawhub install erpclaw", "suggestion": "clawhub install erpclaw"}))
@@ -1640,7 +1641,7 @@ ACTIONS = {
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ERPClaw India Regional Skill")
+    parser = SafeArgumentParser(description="ERPClaw India Regional Skill")
     parser.add_argument("--action", required=True, choices=sorted(ACTIONS.keys()))
     parser.add_argument("--db-path", default=None)
 
@@ -1686,7 +1687,8 @@ def main():
     parser.add_argument("--employee-id")
     parser.add_argument("--fiscal-year")
 
-    args, _unknown = parser.parse_known_args()
+    args, unknown = parser.parse_known_args()
+    check_unknown_args(parser, unknown)
     check_input_lengths(args)
 
     db_path = args.db_path or DEFAULT_DB_PATH

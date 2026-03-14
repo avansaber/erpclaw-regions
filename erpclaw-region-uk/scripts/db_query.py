@@ -33,6 +33,7 @@ try:
     from erpclaw_lib.dependencies import check_required_tables
     from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row, update_row
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
+    from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
     import json as _json
     print(_json.dumps({"status": "error", "error": "ERPClaw foundation not installed. Install erpclaw first: clawhub install erpclaw", "suggestion": "clawhub install erpclaw"}))
@@ -1358,7 +1359,7 @@ ACTIONS = {
 
 
 def main():
-    parser = argparse.ArgumentParser(description="ERPClaw UK Regional Skill")
+    parser = SafeArgumentParser(description="ERPClaw UK Regional Skill")
     parser.add_argument("--action", required=True, help="Action to perform")
     parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="Path to SQLite database")
     parser.add_argument("--company-id", default=None, help="Company ID")
@@ -1398,7 +1399,8 @@ def main():
     # CIS flags
     parser.add_argument("--cis-rate", default=None, help="CIS rate (standard/higher/gross)")
 
-    args, _unknown = parser.parse_known_args()
+    args, unknown = parser.parse_known_args()
+    check_unknown_args(parser, unknown)
     action_name = args.action.lower()
 
     if action_name not in ACTIONS:
