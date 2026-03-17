@@ -30,7 +30,7 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
-    from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row
+    from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row, now
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
@@ -526,7 +526,7 @@ def setup_gst(conn, args):
             if existing:
                 q_upd = (Q.update(rs)
                          .set(rs.value, P())
-                         .set(rs.updated_at, LiteralValue("datetime('now')"))
+                         .set(rs.updated_at, now())
                          .where(rs.id == P()))
                 conn.execute(q_upd.get_sql(), (val, existing["id"]))
             else:
@@ -724,8 +724,8 @@ def generate_gstr3b(conn, args):
     si_t = Table("sales_invoice")
     q_sales = (Q.from_(si_t)
                .select(
-                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("taxable"),
-                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax"),
+                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("taxable"),
+                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax"),
                )
                .where(si_t.company_id == P())
                .where(si_t.status == P())
@@ -737,8 +737,8 @@ def generate_gstr3b(conn, args):
     pi_t = Table("purchase_invoice")
     q_purch = (Q.from_(pi_t)
                .select(
-                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("taxable"),
-                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax"),
+                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("taxable"),
+                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax"),
                )
                .where(pi_t.company_id == P())
                .where(pi_t.status == P())
@@ -839,7 +839,7 @@ def compute_itc(conn, args):
     # All purchase tax for the period
     pi_t = Table("purchase_invoice")
     q = (Q.from_(pi_t)
-         .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total_tax"))
+         .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total_tax"))
          .where(pi_t.company_id == P())
          .where(pi_t.status == P())
          .where(pi_t.posting_date >= P())
@@ -1152,7 +1152,7 @@ def india_tax_summary(conn, args):
     # GST collected (output tax from sales)
     si_t = Table("sales_invoice")
     q_st = (Q.from_(si_t)
-            .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"))
+            .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"))
             .where(si_t.company_id == P())
             .where(si_t.status == P())
             .where(si_t.posting_date >= P())
@@ -1162,7 +1162,7 @@ def india_tax_summary(conn, args):
     # GST paid (input tax from purchases)
     pi_t = Table("purchase_invoice")
     q_pt = (Q.from_(pi_t)
-            .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"))
+            .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"))
             .where(pi_t.company_id == P())
             .where(pi_t.status == P())
             .where(pi_t.posting_date >= P())

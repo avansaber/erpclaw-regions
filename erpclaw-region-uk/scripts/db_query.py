@@ -31,7 +31,7 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
-    from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row, update_row
+    from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row, update_row, now
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
@@ -228,7 +228,7 @@ def setup_vat(conn, args):
         existing = conn.execute(q_chk_rs.get_sql(), (cid, key)).fetchone()
         if existing:
             sql = update_row("regional_settings",
-                             data={"value": P(), "updated_at": LiteralValue("datetime('now')")},
+                             data={"value": P(), "updated_at": now()},
                              where={"id": P()})
             conn.execute(sql, (value, existing["id"]))
         else:
@@ -863,7 +863,7 @@ def generate_vat_return(conn, args):
     # Reusable WHERE filters for invoice queries
     def _invoice_period_q(tbl, col_expr):
         return (Q.from_(tbl)
-                .select(fn.Coalesce(fn.Sum(LiteralValue(f'CAST("{col_expr}" AS REAL)')), 0).as_("total"))
+                .select(fn.Coalesce(fn.Sum(LiteralValue(f'CAST("{col_expr}" AS NUMERIC)')), 0).as_("total"))
                 .where(tbl.company_id == P())
                 .where(tbl.posting_date >= P())
                 .where(tbl.posting_date < P())
@@ -943,8 +943,8 @@ def generate_mtd_payload(conn, args):
     def _mtd_q(tbl):
         return (Q.from_(tbl)
                 .select(
-                    fn.Coalesce(fn.Sum(LiteralValue('CAST("tax_amount" AS REAL)')), 0).as_("vat"),
-                    fn.Coalesce(fn.Sum(LiteralValue('CAST("total_amount" AS REAL)')), 0).as_("net"),
+                    fn.Coalesce(fn.Sum(LiteralValue('CAST("tax_amount" AS NUMERIC)')), 0).as_("vat"),
+                    fn.Coalesce(fn.Sum(LiteralValue('CAST("total_amount" AS NUMERIC)')), 0).as_("net"),
                 )
                 .where(tbl.company_id == P())
                 .where(tbl.posting_date >= P())
@@ -1065,9 +1065,9 @@ def generate_eps(conn, args):
     q = (Q.from_(_t_sal_slip)
          .select(
              fn.Count("*").as_("emp_count"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS REAL)')), 0).as_("total_gross"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS REAL)')), 0).as_("total_deductions"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS REAL)')), 0).as_("total_net"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS NUMERIC)')), 0).as_("total_gross"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS NUMERIC)')), 0).as_("total_deductions"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS NUMERIC)')), 0).as_("total_net"),
          )
          .where(_t_sal_slip.company_id == P())
          .where(_t_sal_slip.period_start.like(P()))
@@ -1114,9 +1114,9 @@ def generate_p60(conn, args):
 
     q = (Q.from_(_t_sal_slip)
          .select(
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS REAL)')), 0).as_("total_gross"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS REAL)')), 0).as_("total_tax"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS REAL)')), 0).as_("total_net"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS NUMERIC)')), 0).as_("total_gross"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS NUMERIC)')), 0).as_("total_tax"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS NUMERIC)')), 0).as_("total_net"),
          )
          .where(_t_sal_slip.employee_id == P())
          .where(_t_sal_slip.period_start >= P())
@@ -1155,8 +1155,8 @@ def generate_p45(conn, args):
     # Total pay and tax up to leaving date
     q = (Q.from_(_t_sal_slip)
          .select(
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS REAL)')), 0).as_("total_gross"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS REAL)')), 0).as_("total_tax"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS NUMERIC)')), 0).as_("total_gross"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS NUMERIC)')), 0).as_("total_tax"),
          )
          .where(_t_sal_slip.employee_id == P())
          .where(_t_sal_slip.status == P()))
@@ -1216,7 +1216,7 @@ def uk_tax_summary(conn, args):
     # Reusable builder for tax summary invoice queries (uses <= for to_date)
     def _tax_sum_q(tbl, col_expr):
         return (Q.from_(tbl)
-                .select(fn.Coalesce(fn.Sum(LiteralValue(f'CAST("{col_expr}" AS REAL)')), 0).as_("total"))
+                .select(fn.Coalesce(fn.Sum(LiteralValue(f'CAST("{col_expr}" AS NUMERIC)')), 0).as_("total"))
                 .where(tbl.company_id == P())
                 .where(tbl.posting_date >= P())
                 .where(tbl.posting_date <= P())
@@ -1238,9 +1238,9 @@ def uk_tax_summary(conn, args):
     q = (Q.from_(_t_sal_slip)
          .select(
              fn.Count("*").as_("slip_count"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS REAL)')), 0).as_("total_gross"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS REAL)')), 0).as_("total_deductions"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS REAL)')), 0).as_("total_net"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS NUMERIC)')), 0).as_("total_gross"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS NUMERIC)')), 0).as_("total_deductions"),
+             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS NUMERIC)')), 0).as_("total_net"),
          )
          .where(_t_sal_slip.company_id == P())
          .where(_t_sal_slip.period_start >= P())

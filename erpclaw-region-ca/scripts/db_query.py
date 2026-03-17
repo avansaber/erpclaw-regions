@@ -30,7 +30,7 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
-    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs, now
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
@@ -927,7 +927,7 @@ def compute_itc(conn, args):
     _pi = Table("purchase_invoice")
     q = (Q.from_(_pi)
          .select(
-             fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_amount"),
+             fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_amount"),
              fn.Count("*").as_("invoice_count"))
          .where((_pi.company_id == P()) & (_pi.status == P())
                 & (_pi.posting_date >= P()) & (_pi.posting_date < P())))
@@ -1100,7 +1100,7 @@ def setup_gst_hst(conn, args):
     _rs = Table("regional_settings")
     _rs_sel = Q.from_(_rs).select(_rs.id).where((_rs.company_id == P()) & (_rs.key == P()))
     _rs_upd = (Q.update(_rs).set(_rs.value, P())
-               .set(_rs.updated_at, LiteralValue("datetime('now')"))
+               .set(_rs.updated_at, now())
                .where(_rs.id == P()))
     _rs_ins = (Q.into(_rs).columns("id", "company_id", "key", "value")
                .insert(P(), P(), P(), P()))
@@ -1859,8 +1859,8 @@ def generate_gst_hst_return(conn, args):
     _si = Table("sales_invoice")
     _si_q = (Q.from_(_si)
              .select(
-                 fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("revenue"),
-                 fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_collected"),
+                 fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("revenue"),
+                 fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_collected"),
                  fn.Count("*").as_("invoice_count"))
              .where((_si.company_id == P()) & (_si.status == P())
                     & (_si.posting_date >= P()) & (_si.posting_date < P())))
@@ -1870,7 +1870,7 @@ def generate_gst_hst_return(conn, args):
     _pi2 = Table("purchase_invoice")
     _pi2_q = (Q.from_(_pi2)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_paid"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_paid"),
                   fn.Count("*").as_("invoice_count"))
               .where((_pi2.company_id == P()) & (_pi2.status == P())
                      & (_pi2.posting_date >= P()) & (_pi2.posting_date < P())))
@@ -1929,8 +1929,8 @@ def generate_qst_return(conn, args):
     _si3 = Table("sales_invoice")
     _si3_q = (Q.from_(_si3)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("revenue"),
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_collected"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("revenue"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_collected"),
                   fn.Count("*").as_("invoice_count"))
               .where((_si3.company_id == P()) & (_si3.status == P())
                      & (_si3.posting_date >= P()) & (_si3.posting_date < P())))
@@ -1940,7 +1940,7 @@ def generate_qst_return(conn, args):
     _pi3 = Table("purchase_invoice")
     _pi3_q = (Q.from_(_pi3)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("tax_paid"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_paid"),
                   fn.Count("*").as_("invoice_count"))
               .where((_pi3.company_id == P()) & (_pi3.status == P())
                      & (_pi3.posting_date >= P()) & (_pi3.posting_date < P())))
@@ -1994,8 +1994,8 @@ def generate_t4(conn, args):
     # Sum salary slips for the year
     # raw SQL — LIKE pattern with dynamic year prefix
     slips = conn.execute(
-        """SELECT COALESCE(SUM(CAST(gross_pay AS REAL)), 0) as total_gross,
-                  COALESCE(SUM(CAST(total_deductions AS REAL)), 0) as total_deductions,
+        """SELECT COALESCE(SUM(CAST(gross_pay AS NUMERIC)), 0) as total_gross,
+                  COALESCE(SUM(CAST(total_deductions AS NUMERIC)), 0) as total_deductions,
                   COUNT(*) as slip_count
            FROM salary_slip
            WHERE employee_id = ? AND status = 'submitted'
@@ -2284,8 +2284,8 @@ def ca_tax_summary(conn, args):
     _si4 = Table("sales_invoice")
     _si4_q = (Q.from_(_si4)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"),
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("revenue"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("revenue"),
                   fn.Count("*").as_("count"))
               .where((_si4.company_id == P()) & (_si4.status == P())
                      & (_si4.posting_date >= P()) & (_si4.posting_date <= P())))
@@ -2295,7 +2295,7 @@ def ca_tax_summary(conn, args):
     _pi4 = Table("purchase_invoice")
     _pi4_q = (Q.from_(_pi4)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"),
                   fn.Count("*").as_("count"))
               .where((_pi4.company_id == P()) & (_pi4.status == P())
                      & (_pi4.posting_date >= P()) & (_pi4.posting_date <= P())))
@@ -2309,8 +2309,8 @@ def ca_tax_summary(conn, args):
     _ss4 = Table("salary_slip")
     _ss4_q = (Q.from_(_ss4)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"gross_pay\" AS REAL)")), 0).as_("total_gross"),
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_deductions\" AS REAL)")), 0).as_("total_deductions"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"gross_pay\" AS NUMERIC)")), 0).as_("total_gross"),
+                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_deductions\" AS NUMERIC)")), 0).as_("total_deductions"),
                   fn.Count("*").as_("slip_count"))
               .where((_ss4.company_id == P()) & (_ss4.status == P())
                      & (_ss4.period_start >= P()) & (_ss4.period_start <= P())))

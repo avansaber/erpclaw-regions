@@ -32,7 +32,7 @@ try:
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
-    from erpclaw_lib.query import Q, P, Table, Field, fn, Order
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Order, now
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
@@ -214,7 +214,7 @@ def setup_eu_vat(conn, args):
             q_upd = (
                 Q.update(rs)
                 .set(rs.value, P())
-                .set(rs.updated_at, LiteralValue("datetime('now')"))
+                .set(rs.updated_at, now())
                 .where(rs.id == P())
             )
             conn.execute(q_upd.get_sql(), (value, existing["id"]))
@@ -617,8 +617,8 @@ def generate_vat_return(conn, args):
     q = (
         Q.from_(si)
         .select(
-            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"),
-            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("net"),
+            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"),
+            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("net"),
         )
         .where(
             (si.company_id == P())
@@ -636,8 +636,8 @@ def generate_vat_return(conn, args):
     q = (
         Q.from_(pi)
         .select(
-            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"),
-            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS REAL)")), 0).as_("net"),
+            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"),
+            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("net"),
         )
         .where(
             (pi.company_id == P())
@@ -950,7 +950,7 @@ def eu_tax_summary(conn, args):
     si = Table("sales_invoice")
     q = (
         Q.from_(si)
-        .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"))
+        .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"))
         .where(
             (si.company_id == P())
             & (si.posting_date >= P())
@@ -965,7 +965,7 @@ def eu_tax_summary(conn, args):
     pi = Table("purchase_invoice")
     q = (
         Q.from_(pi)
-        .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS REAL)")), 0).as_("total"))
+        .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"))
         .where(
             (pi.company_id == P())
             & (pi.posting_date >= P())
