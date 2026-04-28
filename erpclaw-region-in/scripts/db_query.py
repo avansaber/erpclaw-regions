@@ -896,6 +896,19 @@ def generate_einvoice_payload(conn, args):
     q_items = Q.from_(sii).select(sii.star).where(sii.sales_invoice_id == P())
     items = conn.execute(q_items.get_sql(), (args.invoice_id,)).fetchall()
 
+    # GST IRN payload requires numeric JSON values, so we must convert
+    # Decimals to floats here. Quantize first to fix the precision before
+    # the float cast, otherwise binary-float drift can produce values like
+    # 100.00000000001 which the GST portal rejects.
+    def _money(v):
+        return float(Decimal(str(v or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+    def _qty(v):
+        return float(Decimal(str(v or 0)).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+    def _rate(v):
+        return float(Decimal(str(v or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
     item_list = []
     for idx, item in enumerate(items, 1):
         d = row_to_dict(item)
@@ -903,16 +916,16 @@ def generate_einvoice_payload(conn, args):
             "SlNo": str(idx),
             "PrdDesc": d.get("item_name", d.get("description", "")),
             "HsnCd": d.get("hsn_code", ""),
-            "Qty": float(d.get("qty", 0)),
+            "Qty": _qty(d.get("qty", 0)),
             "Unit": d.get("uom", "NOS"),
-            "UnitPrice": float(d.get("rate", 0)),
-            "TotAmt": float(d.get("amount", 0)),
-            "AssAmt": float(d.get("amount", 0)),
-            "GstRt": float(d.get("gst_rate", 18)),
+            "UnitPrice": _money(d.get("rate", 0)),
+            "TotAmt": _money(d.get("amount", 0)),
+            "AssAmt": _money(d.get("amount", 0)),
+            "GstRt": _rate(d.get("gst_rate", 18)),
             "IgstAmt": 0,
             "CgstAmt": 0,
             "SgstAmt": 0,
-            "TotItemVal": float(d.get("amount", 0)),
+            "TotItemVal": _money(d.get("amount", 0)),
         })
 
     payload = {
@@ -943,11 +956,11 @@ def generate_einvoice_payload(conn, args):
         },
         "ItemList": item_list,
         "ValDtls": {
-            "AssVal": float(inv_dict.get("total_amount", 0)),
+            "AssVal": _money(inv_dict.get("total_amount", 0)),
             "IgstVal": 0,
             "CgstVal": 0,
             "SgstVal": 0,
-            "TotInvVal": float(inv_dict.get("grand_total", inv_dict.get("rounded_total", 0))),
+            "TotInvVal": _money(inv_dict.get("grand_total", inv_dict.get("rounded_total", 0))),
         },
     }
 
