@@ -1,6 +1,6 @@
 # ERPClaw Regions
 
-4 regional compliance modules for [ERPClaw](https://github.com/avansaber/erpclaw). Tax rules, payroll deductions, chart of accounts templates, government filings, and ID validation for non-US jurisdictions.
+<!-- SYNC:value:group.erpclaw-regions.module_count -->4<!-- /SYNC --> regional compliance modules for [ERPClaw](https://github.com/avansaber/erpclaw). Tax rules, payroll deductions, chart of accounts templates, government filings, and ID validation for non-US jurisdictions.
 
 ## Modules
 
