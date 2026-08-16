@@ -23,7 +23,9 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 # Add shared lib to path
 try:
-    sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
+    import importlib.util
+    if importlib.util.find_spec("erpclaw_lib") is None:
+        sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
     from erpclaw_lib.db import get_connection, ensure_db_exists, DEFAULT_DB_PATH
     from erpclaw_lib.decimal_utils import to_decimal, round_currency
     from erpclaw_lib.validation import check_input_lengths
@@ -588,7 +590,12 @@ def seed_indian_coa(conn, args):
             # Ensure root_type is valid
             if root_type not in ("asset", "liability", "equity", "income", "expense"):
                 root_type = "asset"
-            # Ensure account_type is valid if provided
+            # Ensure account_type is valid if provided. Private mirror of the
+            # foundation's account_type_registry; anything outside it is blanked
+            # rather than rejected, so a type missing from here is a SILENT
+            # no-op, not an error (M94, 2026-08-12: disposal_gain_loss was added
+            # to the asset above and to this set in the same change, because the
+            # chart edit alone would have typed those two accounts NULL).
             valid_types = {
                 "bank", "cash", "receivable", "payable", "stock",
                 "fixed_asset", "accumulated_depreciation",
@@ -596,7 +603,7 @@ def seed_indian_coa(conn, args):
                 "expense", "stock_received_not_billed",
                 "stock_adjustment", "rounding", "exchange_gain_loss",
                 "depreciation", "payroll_payable", "temporary",
-                "asset_received_not_billed",
+                "asset_received_not_billed", "disposal_gain_loss",
             }
             if acct_type and acct_type not in valid_types:
                 acct_type = None

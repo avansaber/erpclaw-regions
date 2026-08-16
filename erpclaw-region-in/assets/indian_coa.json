@@ -732,7 +732,7 @@
     "account_number": "",
     "parent_account": "Indirect Income",
     "root_type": "income",
-    "account_type": "revenue",
+    "account_type": "disposal_gain_loss",
     "is_group": false
   },
   {
@@ -972,7 +972,7 @@
     "account_number": "",
     "parent_account": "Indirect Expenses",
     "root_type": "expense",
-    "account_type": "expense",
+    "account_type": "disposal_gain_loss",
     "is_group": false
   },
   {
