@@ -177,8 +177,8 @@ All output is JSON to stdout. Parse and format for the user.
 | `uk-generate-ec-sales-list` | `--company-id`, `--period`, `--year` | |
 | `uk-generate-fps` | `--company-id`, `--month`, `--year` | |
 | `uk-generate-eps` | `--company-id`, `--month`, `--year` | |
-| `uk-generate-p60` | `--employee-id`, `--tax-year` | |
-| `uk-generate-p45` | `--employee-id` | |
+| `uk-generate-p60` | `--employee-id`, `--tax-year` | `--company-id` (required when more than one company exists) |
+| `uk-generate-p45` | `--employee-id` | `--company-id` (required when more than one company exists) |
 | `uk-compute-cis-deduction` | `--amount` | `--cis-rate` (standard/higher/gross) |
 
 ### Reports (3 actions)

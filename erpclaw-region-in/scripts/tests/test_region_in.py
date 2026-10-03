@@ -5,6 +5,7 @@ HSN codes, ITC, PF, ESI, professional tax, TDS on salary,
 reports (GSTR1, GSTR3B, HSN summary, e-invoice, e-way bill),
 tax summary, available reports, and status.
 """
+import json
 import os
 import sys
 
@@ -16,6 +17,8 @@ from in_helpers import call_action, ns, is_ok, is_error, load_db_query
 
 _mod = load_db_query()
 ACTIONS = _mod.ACTIONS
+
+_ASSETS_DIR = os.path.normpath(os.path.join(_TESTS_DIR, "..", "..", "assets"))
 
 
 # ── Validation ───────────────────────────────────────────────────────────────
@@ -83,10 +86,43 @@ class TestGSTComputation:
         assert is_error(r)
 
     def test_list_hsn_codes(self, conn, env):
+        from test_region_in_depth import _snapshot
+        with open(os.path.join(_ASSETS_DIR, "gst_hsn_codes.json")) as f:
+            asset_codes = json.load(f)
+        before = _snapshot(conn)
         r = call_action(ACTIONS["india-list-hsn-codes"], conn, ns())
         assert is_ok(r)
         assert "codes" in r
         assert "total_count" in r
+        # Deepened: the listing is the asset file, unfiltered and exact.
+        assert r["total_count"] == len(asset_codes)
+        assert r["showing"] == min(len(asset_codes), 50)
+        assert r["codes"][0] == asset_codes[0]
+        assert r["codes"][0]["code"] == "0101"
+        # The gst_rate filter compares exact rate strings.
+        r18 = call_action(ACTIONS["india-list-hsn-codes"], conn,
+                          ns(search=None, gst_rate="18"))
+        assert is_ok(r18)
+        assert r18["total_count"] == len(
+            [c for c in asset_codes
+             if str(c.get("gst_rate", c.get("rate", ""))) == "18"])
+        assert all(str(c.get("gst_rate", c.get("rate", ""))) == "18"
+                   for c in r18["codes"])
+        # Asset-backed only: no database table is touched, so nothing can
+        # reach the ledger either.
+        assert _snapshot(conn) == before
+
+    def test_list_hsn_codes_no_match_returns_empty(self, conn, env):
+        from test_region_in_depth import _snapshot
+        before = _snapshot(conn)
+        r = call_action(ACTIONS["india-list-hsn-codes"], conn,
+                        ns(search="zzz-no-such-code"))
+        assert is_ok(r)
+        assert r["total_count"] == 0
+        assert r["codes"] == []
+        # No refusal path exists: every parameter is an optional filter, so
+        # an unmatched filter is an empty ok, not an error.
+        assert _snapshot(conn) == before
 
 
 # ── Payroll ──────────────────────────────────────────────────────────────────

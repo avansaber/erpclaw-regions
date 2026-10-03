@@ -171,6 +171,12 @@ class TestPayroll:
         assert r["net_pay"]
 
     def test_payroll_summary(self, conn, env):
+        import uuid as _uuid
+        conn.execute(
+            "INSERT INTO regional_settings (id, company_id, key, value) "
+            "VALUES (?, ?, 'province', ?)",
+            (str(_uuid.uuid4()), env["company_id"], "ON"))
+        conn.commit()
         r = call_action(ACTIONS["ca-payroll-summary"], conn, ns(
             company_id=env["company_id"], month="1", year="2026"))
         assert is_ok(r)

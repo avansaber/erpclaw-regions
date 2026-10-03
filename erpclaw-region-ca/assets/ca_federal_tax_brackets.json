@@ -10,5 +10,6 @@
     {"from": "181440", "to": "258482", "rate": "29"},
     {"from": "258482", "to": "999999999", "rate": "33"}
   ],
-  "note": "Lowest rate reduced from 15% to 14% effective 2026 (enacted mid-2025). BPA clawed back for income above $181,440, reaching minimum at $258,482."
+  "note": "Lowest rate reduced from 15% to 14% effective 2026 (enacted mid-2025). BPA clawed back for income above $181,440, reaching minimum at $258,482.",
+  "quebec_abatement_rate": "16.5"
 }

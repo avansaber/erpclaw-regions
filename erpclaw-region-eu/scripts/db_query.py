@@ -28,13 +28,14 @@ try:
     import importlib.util
     if importlib.util.find_spec("erpclaw_lib") is None:
         sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
-    from erpclaw_lib.db import get_connection, ensure_db_exists, DEFAULT_DB_PATH
+    from erpclaw_lib.db import get_connection
     from erpclaw_lib.decimal_utils import to_decimal, round_currency
     from erpclaw_lib.validation import check_input_lengths
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
-    from erpclaw_lib.query import Q, P, Table, Field, fn, Order, now
+    from erpclaw_lib.query import Q, P, Table, Field, fn, Order, DecimalSum, now
+    from erpclaw_lib.query_helpers import resolve_company_id, resolve_scope_company
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
@@ -66,19 +67,27 @@ def _load_json_asset(filename):
         return json.load(f)
 
 
-def _get_company(conn, company_id):
+def _get_company(conn, company_id, company_name=None):
     co = Table("company")
     if not company_id:
-        q = Q.from_(co).select(co.star).limit(1)
-        row = conn.execute(q.get_sql()).fetchone()
-        if not row:
-            err("No company found. Create one with erpclaw first.")
-        return row_to_dict(row)
+        company_id = resolve_scope_company(conn, None, company_name)
+    else:
+        resolve_scope_company(conn, company_id)
     q = Q.from_(co).select(co.star).where(co.id == P())
     row = conn.execute(q.get_sql(), (company_id,)).fetchone()
-    if not row:
-        err(f"Company not found: {company_id}")
     return row_to_dict(row)
+
+
+def _resolve_company_flag(conn, args):
+    if getattr(args, "company_name", None) and not args.company_id:
+        term = args.company_name.strip()
+        co = Table("company")
+        q = Q.from_(co).select(co.id).where(co.id == P())
+        rows = conn.execute(q.get_sql(), (term,)).fetchall()
+        if rows:
+            args.company_id = rows[0]["id"]
+        else:
+            args.company_id = resolve_company_id(conn, None, args.company_name)
 
 
 def _check_eu_company(company):
@@ -118,7 +127,7 @@ def _get_vat_rate_for_country(country_code, rate_type="standard"):
 
 def seed_eu_defaults(conn, args):
     """Create VAT accounts and tax templates for the company's EU member state."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     country = company["country"].upper()
@@ -182,7 +191,7 @@ def seed_eu_defaults(conn, args):
 
 def setup_eu_vat(conn, args):
     """Store EU VAT number and member state for a company."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
 
@@ -240,7 +249,7 @@ def setup_eu_vat(conn, args):
 
 def seed_eu_coa(conn, args):
     """Import generic European Chart of Accounts template."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
 
@@ -598,7 +607,7 @@ def triangulation_check(conn, args):
 
 def generate_vat_return(conn, args):
     """Generate VAT return for an EU member state company."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     period = args.period or args.month
@@ -619,8 +628,8 @@ def generate_vat_return(conn, args):
     q = (
         Q.from_(si)
         .select(
-            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"),
-            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("net"),
+            fn.Coalesce(DecimalSum(si.tax_amount), ValueWrapper("0")).as_("total"),
+            fn.Coalesce(DecimalSum(si.total_amount), ValueWrapper("0")).as_("net"),
         )
         .where(
             (si.company_id == P())
@@ -638,8 +647,8 @@ def generate_vat_return(conn, args):
     q = (
         Q.from_(pi)
         .select(
-            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"),
-            fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("net"),
+            fn.Coalesce(DecimalSum(pi.tax_amount), ValueWrapper("0")).as_("total"),
+            fn.Coalesce(DecimalSum(pi.total_amount), ValueWrapper("0")).as_("net"),
         )
         .where(
             (pi.company_id == P())
@@ -669,7 +678,7 @@ def generate_vat_return(conn, args):
 
 def generate_ec_sales_list(conn, args):
     """Generate EC Sales List for intra-community B2B supplies."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     period = args.period or args.month
@@ -692,7 +701,7 @@ def generate_ec_sales_list(conn, args):
 
 def generate_saft_export(conn, args):
     """Generate SAF-T (Standard Audit File for Tax) export structure."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     from_date = args.from_date
@@ -757,7 +766,7 @@ def generate_saft_export(conn, args):
 
 def generate_intrastat_dispatches(conn, args):
     """Generate Intrastat Dispatches report (goods sent to other EU states)."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     period = args.period or args.month
@@ -779,7 +788,7 @@ def generate_intrastat_dispatches(conn, args):
 
 def generate_intrastat_arrivals(conn, args):
     """Generate Intrastat Arrivals report (goods received from other EU states)."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     period = args.period or args.month
@@ -801,7 +810,7 @@ def generate_intrastat_arrivals(conn, args):
 
 def generate_einvoice_en16931(conn, args):
     """Generate EN 16931 e-invoice payload."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     invoice_id = args.invoice_id
@@ -847,7 +856,7 @@ def generate_einvoice_en16931(conn, args):
 
 def generate_oss_return(conn, args):
     """Generate OSS (One Stop Shop) quarterly VAT return."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     quarter = args.quarter
@@ -939,7 +948,7 @@ def list_intrastat_codes(conn, args):
 
 def eu_tax_summary(conn, args):
     """EU tax dashboard: domestic VAT + intra-community totals."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_eu_company(company)
     cid = company["id"]
     from_date = args.from_date
@@ -952,7 +961,7 @@ def eu_tax_summary(conn, args):
     si = Table("sales_invoice")
     q = (
         Q.from_(si)
-        .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"))
+        .select(fn.Coalesce(DecimalSum(si.tax_amount), ValueWrapper("0")).as_("total"))
         .where(
             (si.company_id == P())
             & (si.posting_date >= P())
@@ -967,7 +976,7 @@ def eu_tax_summary(conn, args):
     pi = Table("purchase_invoice")
     q = (
         Q.from_(pi)
-        .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"))
+        .select(fn.Coalesce(DecimalSum(pi.tax_amount), ValueWrapper("0")).as_("total"))
         .where(
             (pi.company_id == P())
             & (pi.posting_date >= P())
@@ -1030,7 +1039,7 @@ def status(conn, args):
 
     if args.company_id:
         try:
-            company = _get_company(conn, args.company_id)
+            company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
             _check_eu_company(company)
             cid = company["id"]
             try:
@@ -1090,8 +1099,9 @@ ACTIONS = {
 def main():
     parser = SafeArgumentParser(description="ERPClaw EU Regional Skill")
     parser.add_argument("--action", required=True, help="Action to perform")
-    parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="Path to SQLite database")
+    parser.add_argument("--db-path", default=None, help="Path to SQLite database")
     parser.add_argument("--company-id", default=None, help="Company ID")
+    parser.add_argument("--company", dest="company_name", default=None)
 
     # VAT flags
     parser.add_argument("--amount", default=None, help="Amount for computation")
@@ -1136,9 +1146,8 @@ def main():
              suggestion=f"Available actions: {', '.join(sorted(ACTIONS.keys()))}")
 
     try:
-        if args.db_path != DEFAULT_DB_PATH:
-            ensure_db_exists(args.db_path)
-        conn = get_connection(args.db_path)
+        db_path = getattr(args, "db_path", None)
+        conn = get_connection(db_path)
     except FileNotFoundError as e:
         err(str(e), suggestion="Run init_db.py first to create the database.")
     except Exception as e:
@@ -1152,6 +1161,7 @@ def main():
         conn.close()
         sys.exit(1)
 
+    _resolve_company_flag(conn, args)
     try:
         ACTIONS[action_name](conn, args)
     except SystemExit:

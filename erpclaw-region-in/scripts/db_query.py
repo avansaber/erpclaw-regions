@@ -26,13 +26,14 @@ try:
     import importlib.util
     if importlib.util.find_spec("erpclaw_lib") is None:
         sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
-    from erpclaw_lib.db import get_connection, ensure_db_exists, DEFAULT_DB_PATH
+    from erpclaw_lib.db import get_connection
     from erpclaw_lib.decimal_utils import to_decimal, round_currency
     from erpclaw_lib.validation import check_input_lengths
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
-    from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row, now
+    from erpclaw_lib.query import Q, P, Table, Field, fn, DecimalSum, insert_row, now
+    from erpclaw_lib.query_helpers import resolve_company_id, resolve_scope_company
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
@@ -76,19 +77,27 @@ def _load_json_asset(filename):
         return json.load(f)
 
 
-def _get_company(conn, company_id):
+def _get_company(conn, company_id, company_name=None):
     co = Table("company")
     if not company_id:
-        q = Q.from_(co).select(co.star).limit(1)
-        row = conn.execute(q.get_sql()).fetchone()
-        if not row:
-            err("No company found. Create one with erpclaw first.")
-        return row_to_dict(row)
+        company_id = resolve_scope_company(conn, None, company_name)
+    else:
+        resolve_scope_company(conn, company_id)
     q = Q.from_(co).select(co.star).where(co.id == P())
     row = conn.execute(q.get_sql(), (company_id,)).fetchone()
-    if not row:
-        err(f"Company not found: {company_id}")
     return row_to_dict(row)
+
+
+def _resolve_company_flag(conn, args):
+    if getattr(args, "company_name", None) and not args.company_id:
+        term = args.company_name.strip()
+        co = Table("company")
+        q = Q.from_(co).select(co.id).where(co.id == P())
+        rows = conn.execute(q.get_sql(), (term,)).fetchall()
+        if rows:
+            args.company_id = rows[0]["id"]
+        else:
+            args.company_id = resolve_company_id(conn, None, args.company_name)
 
 
 def _check_india_company(company):
@@ -376,7 +385,7 @@ def add_reverse_charge_rule(conn, args):
 # ---------------------------------------------------------------------------
 
 def seed_india_defaults(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     company_id = company["id"]
     created = {"accounts": 0, "templates": 0, "categories": 0}
@@ -486,7 +495,7 @@ def seed_india_defaults(conn, args):
 
 
 def setup_gst(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
 
     if not args.gstin:
@@ -552,7 +561,7 @@ def setup_gst(conn, args):
 
 
 def seed_indian_coa(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     company_id = company["id"]
 
@@ -633,7 +642,7 @@ def seed_indian_coa(conn, args):
 # ---------------------------------------------------------------------------
 
 def generate_gstr1(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     if not args.month or not args.year:
         err("--month and --year are required")
@@ -713,7 +722,7 @@ def generate_gstr1(conn, args):
 
 
 def generate_gstr3b(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     if not args.month or not args.year:
         err("--month and --year are required")
@@ -731,8 +740,8 @@ def generate_gstr3b(conn, args):
     si_t = Table("sales_invoice")
     q_sales = (Q.from_(si_t)
                .select(
-                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("taxable"),
-                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax"),
+                   fn.Coalesce(DecimalSum(si_t.total_amount), ValueWrapper("0")).as_("taxable"),
+                   fn.Coalesce(DecimalSum(si_t.tax_amount), ValueWrapper("0")).as_("tax"),
                )
                .where(si_t.company_id == P())
                .where(si_t.status == P())
@@ -744,8 +753,8 @@ def generate_gstr3b(conn, args):
     pi_t = Table("purchase_invoice")
     q_purch = (Q.from_(pi_t)
                .select(
-                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("taxable"),
-                   fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax"),
+                   fn.Coalesce(DecimalSum(pi_t.total_amount), ValueWrapper("0")).as_("taxable"),
+                   fn.Coalesce(DecimalSum(pi_t.tax_amount), ValueWrapper("0")).as_("tax"),
                )
                .where(pi_t.company_id == P())
                .where(pi_t.status == P())
@@ -786,7 +795,7 @@ def generate_gstr3b(conn, args):
 
 
 def generate_hsn_summary(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     if not args.from_date or not args.to_date:
         err("--from-date and --to-date are required")
@@ -833,7 +842,7 @@ def generate_hsn_summary(conn, args):
 
 
 def compute_itc(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     if not args.month or not args.year:
         err("--month and --year are required")
@@ -846,7 +855,7 @@ def compute_itc(conn, args):
     # All purchase tax for the period
     pi_t = Table("purchase_invoice")
     q = (Q.from_(pi_t)
-         .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total_tax"))
+         .select(fn.Coalesce(DecimalSum(pi_t.tax_amount), ValueWrapper("0")).as_("total_tax"))
          .where(pi_t.company_id == P())
          .where(pi_t.status == P())
          .where(pi_t.posting_date >= P())
@@ -1129,7 +1138,7 @@ def tds_withhold(conn, args):
 
 
 def generate_tds_return(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     if not args.quarter or not args.year:
         err("--quarter and --year are required")
@@ -1162,7 +1171,7 @@ def generate_tds_return(conn, args):
 
 
 def india_tax_summary(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     if not args.from_date or not args.to_date:
         err("--from-date and --to-date are required")
@@ -1172,7 +1181,7 @@ def india_tax_summary(conn, args):
     # GST collected (output tax from sales)
     si_t = Table("sales_invoice")
     q_st = (Q.from_(si_t)
-            .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"))
+            .select(fn.Coalesce(DecimalSum(si_t.tax_amount), ValueWrapper("0")).as_("total"))
             .where(si_t.company_id == P())
             .where(si_t.status == P())
             .where(si_t.posting_date >= P())
@@ -1182,7 +1191,7 @@ def india_tax_summary(conn, args):
     # GST paid (input tax from purchases)
     pi_t = Table("purchase_invoice")
     q_pt = (Q.from_(pi_t)
-            .select(fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"))
+            .select(fn.Coalesce(DecimalSum(pi_t.tax_amount), ValueWrapper("0")).as_("total"))
             .where(pi_t.company_id == P())
             .where(pi_t.status == P())
             .where(pi_t.posting_date >= P())
@@ -1210,17 +1219,82 @@ def india_tax_summary(conn, args):
 # Payroll actions
 # ---------------------------------------------------------------------------
 
+def _validate_report_year_month(args):
+    """Validate --year/--month for the monthly payroll reports.
+
+    The month match is a LIKE prefix, so a non-integer year (for example
+    one containing a wildcard character) would widen the match. Parsing
+    both values as integers first keeps the match to exactly one month.
+    """
+    if not args.month or not args.year:
+        err("--month and --year are required")
+    try:
+        year = int(args.year)
+    except (TypeError, ValueError):
+        err(f"Invalid year: {args.year}. Use a four-digit integer year.")
+    try:
+        month = int(args.month)
+    except (TypeError, ValueError):
+        err(f"Invalid month: {args.month}. Use an integer 1-12.")
+    if month < 1 or month > 12:
+        err(f"Invalid month: {args.month}. Use an integer 1-12.")
+    return year, month
+
+
+def _month_slips(conn, company_id, year, month):
+    """All of a company's slips for one month (shared period rule).
+
+    One shared period rule for the payroll summary: slips whose
+    period_start falls in the YYYY-MM prefix and whose status shows the
+    pay was actually run. Both submitted and paid slips count: paid means
+    the wages were paid and the deductions withheld, so dropping them
+    would understate the month. Draft and cancelled slips never count.
+    """
+    _ss = Table("salary_slip")
+    crit = ((_ss.company_id == P()) & (_ss.period_start.like(P()))
+            & ((_ss.status == P()) | (_ss.status == P())))
+    params = [company_id, "%s-%02d%%" % (year, month), "submitted", "paid"]
+    q = Q.from_(_ss).select(_ss.star).where(crit).orderby(_ss.period_start)
+    return [row_to_dict(r) for r in conn.execute(q.get_sql(), tuple(params)).fetchall()]
+
+
 def seed_india_payroll(conn, args):
-    company = _get_company(conn, args.company_id)
+    """Seed India payroll salary components (PF, ESI, PT, TDS)."""
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
+    company_id = company["id"]
+    components = [
+        ("PF Employee", "deduction", "Provident Fund - employee contribution (12% of PF wage)", 1),
+        ("PF Employer", "employer_contribution", "Provident Fund - employer contribution (EPF + EPS, 12% of PF wage)", 1),
+        ("ESI Employee", "deduction", "Employees' State Insurance - employee contribution (0.75%)", 1),
+        ("ESI Employer", "employer_contribution", "Employees' State Insurance - employer contribution (3.25%)", 1),
+        ("Professional Tax", "deduction", "Professional tax - state slabs", 1),
+        ("TDS on Salary", "deduction", "Income tax deducted at source on salary (Section 192)", 1),
+    ]
+    _sc = Table("salary_component")
+    _sc_sel = Q.from_(_sc).select(_sc.id).where(_sc.name == P())
+    try:
+        created_count = 0
+        for name, comp_type, desc, is_statutory in components:
+            existing = conn.execute(_sc_sel.get_sql(), (name,)).fetchone()
+            if not existing:
+                sql, _ = insert_row("salary_component", {
+                    "id": P(), "name": P(), "component_type": P(),
+                    "description": P(), "is_statutory": P(),
+                })
+                conn.execute(sql, (str(uuid.uuid4()), name, comp_type, desc, is_statutory))
+                created_count += 1
+        audit(conn, "erpclaw-region-in", "india-seed-india-payroll", "company",
+              company_id, new_values={"components_created": created_count})
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     ok({
-        "message": "India payroll components registered",
-        "components": [
-            "Provident Fund (PF) — 12% employee + 12% employer",
-            "ESI — 0.75% employee + 3.25% employer",
-            "Professional Tax — state-level slabs",
-            "TDS on Salary — Section 192 (new/old regime)",
-        ],
+        "message": "India payroll components seeded",
+        "company_id": company_id,
+        "components_created": created_count,
+        "components": [c[0] for c in components],
         "suggestion": "Use compute-pf, compute-esi, compute-professional-tax, compute-tds-on-salary for calculations.",
     })
 
@@ -1496,7 +1570,7 @@ def generate_form16(conn, args):
 
 
 def generate_form24q(conn, args):
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
     if not args.quarter or not args.year:
         err("--quarter and --year are required")
@@ -1514,31 +1588,121 @@ def generate_form24q(conn, args):
 
 
 def india_payroll_summary(conn, args):
-    company = _get_company(conn, args.company_id)
+    """Per-employee PF/ESI/PT/TDS actually withheld on the month's slips."""
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_india_company(company)
-    if not args.month or not args.year:
-        err("--month and --year are required")
-
+    year, month = _validate_report_year_month(args)
+    company_id = company["id"]
+    needed = ["PF Employee", "ESI Employee", "Professional Tax", "TDS on Salary"]
+    _sc = Table("salary_component")
+    comp_ids = {}
+    missing = []
+    for name in needed:
+        q = Q.from_(_sc).select(_sc.id).where(_sc.name == P())
+        row = conn.execute(q.get_sql(), (name,)).fetchone()
+        if row is None:
+            missing.append(name)
+        else:
+            comp_ids[name] = row["id"]
+    if missing:
+        err(f"India payroll components are not set up: {', '.join(missing)}. Run india-seed-india-payroll first.")
+    slips = _month_slips(conn, company_id, year, month)
+    _ssd = Table("salary_slip_detail")
+    _emp = Table("employee")
+    per_emp = {}
+    totals = {
+        "total_pf_employee": Decimal("0"),
+        "total_pf_employer": Decimal("0"),
+        "total_esi_employee": Decimal("0"),
+        "total_esi_employer": Decimal("0"),
+        "total_professional_tax": Decimal("0"),
+        "total_tds": Decimal("0"),
+    }
+    for slip in slips:
+        slip_id = slip["id"]
+        employee_id = slip["employee_id"]
+        gross = to_decimal(str(slip.get("gross_pay", "0")))
+        qd = Q.from_(_ssd).select(_ssd.star).where(_ssd.salary_slip_id == P())
+        pf_emp = Decimal("0")
+        esi_emp = Decimal("0")
+        pt = Decimal("0")
+        tds = Decimal("0")
+        for det in conn.execute(qd.get_sql(), (slip_id,)).fetchall():
+            d = row_to_dict(det)
+            if d.get("component_type") != "deduction":
+                continue
+            det_comp = d.get("salary_component_id")
+            amt = to_decimal(str(d.get("amount", "0")))
+            if det_comp == comp_ids["PF Employee"]:
+                pf_emp += amt
+            elif det_comp == comp_ids["ESI Employee"]:
+                esi_emp += amt
+            elif det_comp == comp_ids["Professional Tax"]:
+                pt += amt
+            elif det_comp == comp_ids["TDS on Salary"]:
+                tds += amt
+        pf_employer = pf_emp
+        if esi_emp > Decimal("0"):
+            esi_employer = (gross * Decimal("0.0325")).quantize(Decimal("1"), ROUND_HALF_UP)
+        else:
+            esi_employer = Decimal("0")
+        qe = Q.from_(_emp).select(_emp.star).where(_emp.id == P())
+        erow = conn.execute(qe.get_sql(), (employee_id,)).fetchone()
+        ename = row_to_dict(erow).get("full_name", "") if erow is not None else ""
+        agg = per_emp.get(employee_id)
+        if agg is None:
+            agg = per_emp[employee_id] = {
+                "employee_id": employee_id,
+                "employee_name": ename,
+                "slip_count": 0,
+                "gross": Decimal("0"),
+                "pf_employee": Decimal("0"),
+                "pf_employer": Decimal("0"),
+                "esi_employee": Decimal("0"),
+                "esi_employer": Decimal("0"),
+                "professional_tax": Decimal("0"),
+                "tds": Decimal("0"),
+            }
+        agg["slip_count"] += 1
+        agg["gross"] += gross
+        agg["pf_employee"] += pf_emp
+        agg["pf_employer"] += pf_employer
+        agg["esi_employee"] += esi_emp
+        agg["esi_employer"] += esi_employer
+        agg["professional_tax"] += pt
+        agg["tds"] += tds
+        totals["total_pf_employee"] += pf_emp
+        totals["total_pf_employer"] += pf_employer
+        totals["total_esi_employee"] += esi_emp
+        totals["total_esi_employer"] += esi_employer
+        totals["total_professional_tax"] += pt
+        totals["total_tds"] += tds
+    employees = sorted(per_emp.values(), key=lambda e: (e["employee_name"], e["employee_id"]))
     ok({
         "report": "India Payroll Summary",
-        "period": f"{args.year}-{int(args.month):02d}",
+        "period": f"{year}-{month:02d}",
         "company": company.get("name", ""),
-        "employees": [],
-        "totals": {
-            "total_pf_employee": "0.00",
-            "total_pf_employer": "0.00",
-            "total_esi_employee": "0.00",
-            "total_esi_employer": "0.00",
-            "total_professional_tax": "0.00",
-            "total_tds": "0.00",
-        },
-        "note": "Summary populated from salary slips for the period.",
+        "employee_count": len(employees),
+        "slip_count": len(slips),
+        "employees": [{
+            "employee_id": e["employee_id"],
+            "employee_name": e["employee_name"],
+            "slip_count": e["slip_count"],
+            "gross_pay": str(round_currency(e["gross"])),
+            "pf_employee": str(round_currency(e["pf_employee"])),
+            "pf_employer": str(round_currency(e["pf_employer"])),
+            "esi_employee": str(round_currency(e["esi_employee"])),
+            "esi_employer": str(round_currency(e["esi_employer"])),
+            "professional_tax": str(round_currency(e["professional_tax"])),
+            "tds": str(round_currency(e["tds"])),
+        } for e in employees],
+        "totals": {k: str(round_currency(v)) for k, v in totals.items()},
+        "employer_basis": ("Employer PF equals the employee PF on each slip; employer "
+                           "ESI is 3.25% of slip gross, rounded to the rupee, on slips "
+                           "that withheld employee ESI. Salary slips do not store "
+                           "employer contributions."),
     })
 
-
-# ---------------------------------------------------------------------------
-# Status & info actions
-# ---------------------------------------------------------------------------
 
 def status_action(conn, args):
     result = {
@@ -1548,7 +1712,7 @@ def status_action(conn, args):
     }
 
     if args.company_id:
-        company = _get_company(conn, args.company_id)
+        company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
         result["company"] = company.get("name", "")
         result["country"] = company.get("country", "")
 
@@ -1609,7 +1773,7 @@ def available_reports(conn, args):
     ]
 
     if args.company_id:
-        company = _get_company(conn, args.company_id)
+        company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
         ok({"company": company.get("name", ""), "reports": reports, "total": len(reports)})
     else:
         ok({"reports": reports, "total": len(reports)})
@@ -1667,6 +1831,7 @@ def main():
 
     # Company
     parser.add_argument("--company-id")
+    parser.add_argument("--company", dest="company_name", default=None)
 
     # GST
     parser.add_argument("--gstin")
@@ -1711,8 +1876,7 @@ def main():
     check_unknown_args(parser, unknown)
     check_input_lengths(args)
 
-    db_path = args.db_path or DEFAULT_DB_PATH
-    ensure_db_exists(db_path)
+    db_path = getattr(args, "db_path", None)   # None unless --db-path was given
     conn = get_connection(db_path)
 
     # Dependency check
@@ -1723,6 +1887,7 @@ def main():
         conn.close()
         sys.exit(1)
 
+    _resolve_company_flag(conn, args)
     try:
         ACTIONS[args.action](conn, args)
     finally:

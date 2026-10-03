@@ -27,13 +27,14 @@ try:
     import importlib.util
     if importlib.util.find_spec("erpclaw_lib") is None:
         sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
-    from erpclaw_lib.db import get_connection, ensure_db_exists, DEFAULT_DB_PATH
+    from erpclaw_lib.db import get_connection
     from erpclaw_lib.decimal_utils import to_decimal, round_currency
     from erpclaw_lib.validation import check_input_lengths
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
-    from erpclaw_lib.query import Q, P, Table, Field, fn, insert_row, update_row, now
+    from erpclaw_lib.query import Q, P, Table, Field, fn, DecimalSum, insert_row, update_row, now
+    from erpclaw_lib.query_helpers import resolve_company_id, resolve_scope_company
     from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
@@ -71,18 +72,24 @@ def _load_json_asset(filename):
         return json.load(f)
 
 
-def _get_company(conn, company_id):
+def _get_company(conn, company_id, company_name=None):
     if not company_id:
-        q = Q.from_(_t_company).select(_t_company.star).limit(1)
-        row = conn.execute(q.get_sql()).fetchone()
-        if not row:
-            err("No company found. Create one with erpclaw first.")
-        return row_to_dict(row)
+        company_id = resolve_scope_company(conn, None, company_name)
+    else:
+        company_id = resolve_scope_company(conn, company_id)
     q = Q.from_(_t_company).select(_t_company.star).where(_t_company.id == P())
     row = conn.execute(q.get_sql(), (company_id,)).fetchone()
-    if not row:
-        err(f"Company not found: {company_id}")
     return row_to_dict(row)
+
+
+def _resolve_company_flag(conn, args):
+    if getattr(args, "company_name", None) and not getattr(args, "company_id", None):
+        q = Q.from_(_t_company).select(_t_company.id).where(_t_company.id == P())
+        hit = conn.execute(q.get_sql(), (args.company_name,)).fetchone()
+        if hit:
+            args.company_id = hit["id"]
+        else:
+            args.company_id = resolve_company_id(conn, None, args.company_name)
 
 
 def _check_uk_company(company):
@@ -130,7 +137,7 @@ def _resolve_periods(args):
 
 def seed_uk_defaults(conn, args):
     """Create VAT input/output accounts and standard/reduced/zero tax templates."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
 
@@ -202,7 +209,7 @@ def seed_uk_defaults(conn, args):
 
 def setup_vat(conn, args):
     """Store VAT number and MTD flag for a UK company."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
 
@@ -253,7 +260,7 @@ def setup_vat(conn, args):
 
 def seed_uk_coa(conn, args):
     """Import FRS 102 Chart of Accounts."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
 
@@ -303,7 +310,7 @@ def seed_uk_coa(conn, args):
 
 def seed_uk_payroll(conn, args):
     """Register PAYE, NI, student loan, and pension salary components."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
 
@@ -787,7 +794,7 @@ def compute_pension(conn, args):
 
 def uk_payroll_summary(conn, args):
     """Monthly payroll summary with per-employee breakdown."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
     month = args.month or args.period
@@ -845,7 +852,7 @@ def uk_payroll_summary(conn, args):
 
 def generate_vat_return(conn, args):
     """Generate 9-box VAT return (MTD-compatible)."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
     period = args.period or args.month
@@ -865,7 +872,7 @@ def generate_vat_return(conn, args):
     # Reusable WHERE filters for invoice queries
     def _invoice_period_q(tbl, col_expr):
         return (Q.from_(tbl)
-                .select(fn.Coalesce(fn.Sum(LiteralValue(f'CAST("{col_expr}" AS NUMERIC)')), 0).as_("total"))
+                .select(fn.Coalesce(DecimalSum(tbl.field(col_expr)), ValueWrapper("0")).as_("total"))
                 .where(tbl.company_id == P())
                 .where(tbl.posting_date >= P())
                 .where(tbl.posting_date < P())
@@ -925,7 +932,7 @@ def generate_vat_return(conn, args):
 
 def generate_mtd_payload(conn, args):
     """Generate HMRC MTD-compatible JSON payload."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
     period = args.period or args.month
@@ -945,8 +952,8 @@ def generate_mtd_payload(conn, args):
     def _mtd_q(tbl):
         return (Q.from_(tbl)
                 .select(
-                    fn.Coalesce(fn.Sum(LiteralValue('CAST("tax_amount" AS NUMERIC)')), 0).as_("vat"),
-                    fn.Coalesce(fn.Sum(LiteralValue('CAST("total_amount" AS NUMERIC)')), 0).as_("net"),
+                    fn.Coalesce(DecimalSum(tbl.field("tax_amount")), ValueWrapper("0")).as_("vat"),
+                    fn.Coalesce(DecimalSum(tbl.field("total_amount")), ValueWrapper("0")).as_("net"),
                 )
                 .where(tbl.company_id == P())
                 .where(tbl.posting_date >= P())
@@ -969,11 +976,11 @@ def generate_mtd_payload(conn, args):
 
     ok({
         "periodKey": f"{year}-{month:02d}",
-        "vatDueSales": float(vat_due_sales),
-        "vatDueAcquisitions": 0,
-        "totalVatDue": float(vat_due_sales),
-        "vatReclaimedCurrPeriod": float(vat_reclaimed),
-        "netVatDue": float(abs(net_vat)),
+        "vatDueSales": str(vat_due_sales),
+        "vatDueAcquisitions": "0.00",
+        "totalVatDue": str(vat_due_sales),
+        "vatReclaimedCurrPeriod": str(vat_reclaimed),
+        "netVatDue": str(abs(net_vat)),
         "totalValueSalesExVAT": int(total_sales),
         "totalValuePurchasesExVAT": int(total_purchases),
         "totalValueGoodsSuppliedExVAT": 0,
@@ -984,7 +991,7 @@ def generate_mtd_payload(conn, args):
 
 def generate_ec_sales_list(conn, args):
     """Generate EC Sales List (NI Protocol — for Northern Ireland businesses)."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
     period = args.period or args.month
@@ -1005,7 +1012,7 @@ def generate_ec_sales_list(conn, args):
 
 def generate_fps(conn, args):
     """Generate Full Payment Submission (FPS) for HMRC RTI."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
     month = args.month or args.period
@@ -1052,7 +1059,7 @@ def generate_fps(conn, args):
 
 def generate_eps(conn, args):
     """Generate Employer Payment Summary (EPS)."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
     month = args.month or args.period
@@ -1067,9 +1074,9 @@ def generate_eps(conn, args):
     q = (Q.from_(_t_sal_slip)
          .select(
              fn.Count("*").as_("emp_count"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS NUMERIC)')), 0).as_("total_gross"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS NUMERIC)')), 0).as_("total_deductions"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS NUMERIC)')), 0).as_("total_net"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.gross_pay), ValueWrapper("0")).as_("total_gross"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.total_deductions), ValueWrapper("0")).as_("total_deductions"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.net_pay), ValueWrapper("0")).as_("total_net"),
          )
          .where(_t_sal_slip.company_id == P())
          .where(_t_sal_slip.period_start.like(P()))
@@ -1105,6 +1112,9 @@ def generate_p60(conn, args):
     nino = emp.get("ssn", "")
     masked = f"{nino[:2]}****{nino[-1]}" if len(nino) >= 9 else nino
 
+    company = _get_company(conn, getattr(args, "company_id", None),
+                           getattr(args, "company_name", None))
+
     # Sum salary slips for the tax year (April to March)
     if tax_year:
         ty = int(tax_year)
@@ -1116,15 +1126,17 @@ def generate_p60(conn, args):
 
     q = (Q.from_(_t_sal_slip)
          .select(
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS NUMERIC)')), 0).as_("total_gross"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS NUMERIC)')), 0).as_("total_tax"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS NUMERIC)')), 0).as_("total_net"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.gross_pay), ValueWrapper("0")).as_("total_gross"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.total_deductions), ValueWrapper("0")).as_("total_tax"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.net_pay), ValueWrapper("0")).as_("total_net"),
          )
          .where(_t_sal_slip.employee_id == P())
          .where(_t_sal_slip.period_start >= P())
          .where(_t_sal_slip.period_start <= P())
-         .where(_t_sal_slip.status == P()))
-    row = conn.execute(q.get_sql(), (employee_id, date_from, date_to, "submitted")).fetchone()
+         .where(_t_sal_slip.status == P())
+         .where(_t_sal_slip.company_id == P()))
+    row = conn.execute(q.get_sql(), (employee_id, date_from, date_to, "submitted",
+                                     company["id"])).fetchone()
 
     ok({
         "form": "P60",
@@ -1154,15 +1166,19 @@ def generate_p45(conn, args):
     masked = f"{nino[:2]}****{nino[-1]}" if len(nino) >= 9 else nino
     leaving_date = emp.get("date_of_leaving", "")
 
+    company = _get_company(conn, getattr(args, "company_id", None),
+                           getattr(args, "company_name", None))
+
     # Total pay and tax up to leaving date
     q = (Q.from_(_t_sal_slip)
          .select(
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS NUMERIC)')), 0).as_("total_gross"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS NUMERIC)')), 0).as_("total_tax"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.gross_pay), ValueWrapper("0")).as_("total_gross"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.total_deductions), ValueWrapper("0")).as_("total_tax"),
          )
          .where(_t_sal_slip.employee_id == P())
-         .where(_t_sal_slip.status == P()))
-    row = conn.execute(q.get_sql(), (employee_id, "submitted")).fetchone()
+         .where(_t_sal_slip.status == P())
+         .where(_t_sal_slip.company_id == P()))
+    row = conn.execute(q.get_sql(), (employee_id, "submitted", company["id"])).fetchone()
 
     ok({
         "form": "P45",
@@ -1206,7 +1222,7 @@ def compute_cis_deduction(conn, args):
 
 def uk_tax_summary(conn, args):
     """UK tax dashboard: VAT + payroll totals."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_uk_company(company)
     cid = company["id"]
     from_date = args.from_date
@@ -1218,7 +1234,7 @@ def uk_tax_summary(conn, args):
     # Reusable builder for tax summary invoice queries (uses <= for to_date)
     def _tax_sum_q(tbl, col_expr):
         return (Q.from_(tbl)
-                .select(fn.Coalesce(fn.Sum(LiteralValue(f'CAST("{col_expr}" AS NUMERIC)')), 0).as_("total"))
+                .select(fn.Coalesce(DecimalSum(tbl.field(col_expr)), ValueWrapper("0")).as_("total"))
                 .where(tbl.company_id == P())
                 .where(tbl.posting_date >= P())
                 .where(tbl.posting_date <= P())
@@ -1240,9 +1256,9 @@ def uk_tax_summary(conn, args):
     q = (Q.from_(_t_sal_slip)
          .select(
              fn.Count("*").as_("slip_count"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("gross_pay" AS NUMERIC)')), 0).as_("total_gross"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("total_deductions" AS NUMERIC)')), 0).as_("total_deductions"),
-             fn.Coalesce(fn.Sum(LiteralValue('CAST("net_pay" AS NUMERIC)')), 0).as_("total_net"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.gross_pay), ValueWrapper("0")).as_("total_gross"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.total_deductions), ValueWrapper("0")).as_("total_deductions"),
+             fn.Coalesce(DecimalSum(_t_sal_slip.net_pay), ValueWrapper("0")).as_("total_net"),
          )
          .where(_t_sal_slip.company_id == P())
          .where(_t_sal_slip.period_start >= P())
@@ -1302,7 +1318,7 @@ def status(conn, args):
     # Check company config if company_id provided
     if args.company_id:
         try:
-            company = _get_company(conn, args.company_id)
+            company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
             _check_uk_company(company)
             cid = company["id"]
             try:
@@ -1363,8 +1379,9 @@ ACTIONS = {
 def main():
     parser = SafeArgumentParser(description="ERPClaw UK Regional Skill")
     parser.add_argument("--action", required=True, help="Action to perform")
-    parser.add_argument("--db-path", default=DEFAULT_DB_PATH, help="Path to SQLite database")
+    parser.add_argument("--db-path", default=None, help="Path to SQLite database")
     parser.add_argument("--company-id", default=None, help="Company ID")
+    parser.add_argument("--company", dest="company_name", default=None, help="Company name")
 
     # VAT flags
     parser.add_argument("--amount", default=None, help="Amount for tax computation")
@@ -1411,9 +1428,8 @@ def main():
 
     # Connect to DB
     try:
-        if args.db_path != DEFAULT_DB_PATH:
-            ensure_db_exists(args.db_path)
-        conn = get_connection(args.db_path)
+        db_path = getattr(args, "db_path", None)
+        conn = get_connection(db_path)
     except FileNotFoundError as e:
         err(str(e), suggestion="Run init_db.py first to create the database.")
     except Exception as e:
@@ -1426,6 +1442,8 @@ def main():
         print(json.dumps(_dep, indent=2))
         conn.close()
         sys.exit(1)
+
+    _resolve_company_flag(conn, args)
 
     try:
         ACTIONS[action_name](conn, args)

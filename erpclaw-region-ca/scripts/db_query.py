@@ -26,14 +26,15 @@ try:
     import importlib.util
     if importlib.util.find_spec("erpclaw_lib") is None:
         sys.path.insert(0, os.path.join(os.path.expanduser(os.environ.get("ERPCLAW_HOME", "~/.openclaw/erpclaw")), "lib"))
-    from erpclaw_lib.db import get_connection, ensure_db_exists, DEFAULT_DB_PATH
+    from erpclaw_lib.db import get_connection
     from erpclaw_lib.decimal_utils import to_decimal, round_currency
     from erpclaw_lib.validation import check_input_lengths
     from erpclaw_lib.response import ok, err, row_to_dict
     from erpclaw_lib.audit import audit
     from erpclaw_lib.dependencies import check_required_tables
     from erpclaw_lib.query import Q, P, Table, Field, fn, Case, Order, Criterion, Not, NULL, DecimalSum, DecimalAbs, now
-    from erpclaw_lib.vendor.pypika.terms import LiteralValue, ValueWrapper
+    from erpclaw_lib.query_helpers import resolve_company_id, resolve_scope_company
+    from erpclaw_lib.vendor.pypika.terms import ValueWrapper
     from erpclaw_lib.args import SafeArgumentParser, check_unknown_args
 except ImportError:
     import json as _json
@@ -58,19 +59,27 @@ def _load_json_asset(filename):
         return json.load(f)
 
 
-def _get_company(conn, company_id):
+def _get_company(conn, company_id, company_name=None):
     _co = Table("company")
     if not company_id:
-        q = Q.from_(_co).select(_co.star).limit(1)
-        row = conn.execute(q.get_sql()).fetchone()
-        if not row:
-            err("No company found. Create one with erpclaw first.")
-        return row_to_dict(row)
+        company_id = resolve_scope_company(conn, None, company_name)
+    else:
+        resolve_scope_company(conn, company_id)
     q = Q.from_(_co).select(_co.star).where(_co.id == P())
     row = conn.execute(q.get_sql(), (company_id,)).fetchone()
-    if not row:
-        err(f"Company not found: {company_id}")
     return row_to_dict(row)
+
+
+def _resolve_company_flag(conn, args):
+    if getattr(args, "company_name", None) and not args.company_id:
+        term = args.company_name.strip()
+        _co = Table("company")
+        q = Q.from_(_co).select(_co.id).where(_co.id == P())
+        rows = conn.execute(q.get_sql(), (term,)).fetchall()
+        if rows:
+            args.company_id = rows[0]["id"]
+        else:
+            args.company_id = resolve_company_id(conn, None, args.company_name)
 
 
 def _check_ca_company(company):
@@ -98,6 +107,89 @@ def _get_company_province(conn, company):
     except Exception:
         pass
     return ""
+
+
+def _get_federal_credit_rate():
+    """Federal non-refundable credit rate: the lowest bracket rate.
+
+    Federal credits are taken at the lowest bracket rate, so this reads
+    the first bracket of the same table the brackets come from instead
+    of hard-coding a rate.
+    """
+    data = _get_federal_brackets()
+    brackets = data.get("brackets") or []
+    if not brackets:
+        err("Federal tax brackets table carries no brackets.")
+    return to_decimal(str(brackets[0]["rate"])) / Decimal("100")
+
+
+def _get_quebec_abatement_rate():
+    """Federal Quebec abatement rate from the federal table (16.5% for 2026)."""
+    data = _get_federal_brackets()
+    raw = data.get("quebec_abatement_rate", "16.5")
+    return to_decimal(str(raw)) / Decimal("100")
+
+
+def _apply_quebec_abatement(annual_net_tax):
+    """Apply the 16.5% federal abatement: round the abatement, then subtract."""
+    rate = _get_quebec_abatement_rate()
+    abatement = round_currency(annual_net_tax * rate)
+    return round_currency(annual_net_tax - abatement), abatement
+
+
+def _validate_report_year_month(args):
+    """Validate --year/--month for the monthly payroll reports.
+
+    The month match is a LIKE prefix, so a non-integer year (for example
+    one containing a wildcard character) would widen the match. Parsing
+    both values as integers first keeps the match to exactly one month.
+    """
+    if not args.month or not args.year:
+        err("--month and --year are required")
+    try:
+        year = int(args.year)
+    except (TypeError, ValueError):
+        err(f"Invalid year: {args.year}. Use a four-digit integer year.")
+    try:
+        month = int(args.month)
+    except (TypeError, ValueError):
+        err(f"Invalid month: {args.month}. Use an integer 1-12.")
+    if month < 1 or month > 12:
+        err(f"Invalid month: {args.month}. Use an integer 1-12.")
+    return year, month
+
+
+def _month_slips(conn, company_id, year, month, employee_id=None):
+    """All of a company/employee's slips for one month (shared period rule).
+
+    One shared period rule for the payroll summary and PD7A: slips whose
+    period_start falls in the YYYY-MM prefix and whose status shows the
+    pay was actually run. Both submitted and paid slips count: paid means
+    the wages were paid and the deductions withheld, so dropping them
+    would understate the month. Draft and cancelled slips never count.
+    """
+    _ss = Table("salary_slip")
+    crit = ((_ss.company_id == P()) & (_ss.period_start.like(P()))
+            & ((_ss.status == P()) | (_ss.status == P())))
+    params = [company_id, "%s-%02d%%" % (year, month), "submitted", "paid"]
+    if employee_id is not None:
+        crit = crit & (_ss.employee_id == P())
+        params.append(employee_id)
+    q = Q.from_(_ss).select(_ss.star).where(crit).orderby(_ss.period_start)
+    return [row_to_dict(r) for r in conn.execute(q.get_sql(), tuple(params)).fetchall()]
+
+
+def _sum_month_gross(slips):
+    """Aggregate every slip of the month into one monthly gross.
+
+    One shared aggregation rule for the payroll summary and PD7A: a bonus
+    run or semi-monthly payroll means more than one slip per employee per
+    month, and all of them belong in the month's totals.
+    """
+    total = Decimal("0")
+    for slip in slips:
+        total += to_decimal(str(slip.get("gross_pay", "0")))
+    return total
 
 
 # ---------------------------------------------------------------------------
@@ -437,6 +529,39 @@ def _get_ei_rates():
             }
         return data
     return _EI_RATES
+
+
+_QPIP_RATES = {
+    "employee_rate": "0.494",
+    "employer_rate": "0.692",
+    "max_insurable_earnings": "103000",
+    "max_employee_premium": "508.82",
+    "max_employer_premium": "712.76",
+}
+
+
+def _get_qpip_rates():
+    """QPIP rates from the qpip block of the EI asset, else the fallback."""
+    data = _try_load_json_asset("ca_ei_rates.json")
+    if data is not None:
+        block = data.get("qpip")
+        if isinstance(block, dict) and block:
+            return {
+                "employee_rate": block.get(
+                    "employee_rate", _QPIP_RATES["employee_rate"]),
+                "employer_rate": block.get(
+                    "employer_rate", _QPIP_RATES["employer_rate"]),
+                "max_insurable_earnings": block.get(
+                    "max_insurable_earnings",
+                    _QPIP_RATES["max_insurable_earnings"]),
+                "max_employee_premium": block.get(
+                    "max_employee_premium",
+                    _QPIP_RATES["max_employee_premium"]),
+                "max_employer_premium": block.get(
+                    "max_employer_premium",
+                    _QPIP_RATES["max_employer_premium"]),
+            }
+    return dict(_QPIP_RATES)
 
 
 def _get_federal_brackets():
@@ -916,7 +1041,7 @@ def list_tax_rates(conn, args):
 
 def compute_itc(conn, args):
     """Compute Input Tax Credits from purchase invoices for a period."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
     if not args.month or not args.year:
         err("--month and --year are required")
@@ -929,7 +1054,7 @@ def compute_itc(conn, args):
     _pi = Table("purchase_invoice")
     q = (Q.from_(_pi)
          .select(
-             fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_amount"),
+             fn.Coalesce(DecimalSum(_pi.tax_amount), ValueWrapper("0")).as_("tax_amount"),
              fn.Count("*").as_("invoice_count"))
          .where((_pi.company_id == P()) & (_pi.status == P())
                 & (_pi.posting_date >= P()) & (_pi.posting_date < P())))
@@ -955,7 +1080,7 @@ def compute_itc(conn, args):
 
 def seed_ca_defaults(conn, args):
     """Seed Canadian GST/HST/PST/QST accounts and tax templates for a company."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
     company_id = company["id"]
     province = _get_company_province(conn, company)
@@ -1059,7 +1184,7 @@ def seed_ca_defaults(conn, args):
 
 def setup_gst_hst(conn, args):
     """Store BN and province in regional_settings, validate BN format."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
 
     bn_input = args.business_number or args.bn
@@ -1129,7 +1254,7 @@ def setup_gst_hst(conn, args):
 
 def seed_ca_coa(conn, args):
     """Seed Canadian Chart of Accounts (ASPE) for a company."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
     company_id = company["id"]
 
@@ -1182,9 +1307,17 @@ def seed_ca_coa(conn, args):
 
     accounts = coa if isinstance(coa, list) else coa.get("accounts", [])
     created_count = 0
+    number_conflicts = []
 
     _acct2 = Table("account")
     _acct2_sel = Q.from_(_acct2).select(_acct2.id).where((_acct2.name == P()) & (_acct2.company_id == P()))
+    taken_numbers = {}
+    _taken_q = (Q.from_(_acct2).select(_acct2.account_number)
+                .where(_acct2.company_id == P()))
+    for _row in conn.execute(_taken_q.get_sql(), (company_id,)).fetchall():
+        _val = row_to_dict(_row).get("account_number")
+        if _val is not None and str(_val) != "":
+            taken_numbers[str(_val)] = True
     _acct2_ins = (Q.into(_acct2)
                   .columns("id", "name", "account_type", "root_type", "company_id",
                            "parent_id", "is_group", "account_number")
@@ -1218,10 +1351,26 @@ def seed_ca_coa(conn, args):
             }
             if acct_type and acct_type not in _valid_acct_types:
                 acct_type = None
+            # Header/group rows carry no account number; store that as NULL
+            # rather than an empty string, which would collide on
+            # UNIQUE(account_number, company_id) and abort the whole seed.
+            # A template number the company already uses on another account
+            # is stored as NULL too and reported, so the seed never fails.
+            raw_number = acct.get("account_number") or ""
+            raw_number = str(raw_number).strip()
+            acct_number = raw_number or None
+            if acct_number is not None and acct_number in taken_numbers:
+                number_conflicts.append({
+                    "account_name": name,
+                    "account_number": acct_number,
+                })
+                acct_number = None
             conn.execute(_acct2_ins.get_sql(),
                          (aid, name, acct_type, root_type, company_id,
                           parent_id, 1 if acct.get("is_group") else 0,
-                          acct.get("account_number", "")))
+                          acct_number))
+            if acct_number is not None:
+                taken_numbers[acct_number] = True
             created_count += 1
 
     audit(conn, "erpclaw-region-ca", "ca-seed-ca-coa", "company", company_id,
@@ -1232,12 +1381,13 @@ def seed_ca_coa(conn, args):
         "company_id": company_id,
         "accounts_created": created_count,
         "total_in_template": len(accounts),
+        "number_conflicts": number_conflicts,
     })
 
 
 def seed_ca_payroll(conn, args):
     """Seed Canadian payroll salary components (CPP, EI, federal/provincial tax, etc.)."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
     company_id = company["id"]
     province = _get_company_province(conn, company)
@@ -1486,12 +1636,16 @@ def compute_federal_tax(conn, args):
 
     gross_tax, breakdown, marginal_rate = _progressive_tax(taxable, data["brackets"])
 
-    # Basic personal amount credit = 15% of BPA
-    personal_credit = round_currency(bpa * Decimal("0.15"))
+    # Basic personal amount credit at the lowest bracket rate
+    personal_credit = round_currency(bpa * _get_federal_credit_rate())
     net_tax = max(round_currency(gross_tax - personal_credit), Decimal("0"))
+    province = (getattr(args, "province", None) or "").upper()
+    abatement = Decimal("0")
+    if province == "QC" and net_tax > Decimal("0"):
+        net_tax, abatement = _apply_quebec_abatement(net_tax)
     effective_rate = round_currency(net_tax / taxable * Decimal("100")) if taxable > 0 else Decimal("0")
 
-    ok({
+    result = {
         "annual_income": str(round_currency(annual_income)),
         "taxable_income": str(round_currency(taxable)),
         "basic_personal_amount": str(bpa),
@@ -1501,7 +1655,11 @@ def compute_federal_tax(conn, args):
         "net_tax": str(net_tax),
         "effective_rate": str(effective_rate),
         "marginal_rate": str(marginal_rate),
-    })
+    }
+    if province == "QC":
+        result["quebec_abatement"] = str(abatement)
+        result["quebec_abatement_rate"] = str(_get_quebec_abatement_rate() * Decimal("100"))
+    ok(result)
 
 
 def compute_provincial_tax(conn, args):
@@ -1630,8 +1788,10 @@ def compute_total_payroll_deductions(conn, args):
     fed_data = _get_federal_brackets()
     fed_bpa = to_decimal(fed_data["basic_personal_amount"])
     fed_gross_tax, _, _ = _progressive_tax(annual_gross, fed_data["brackets"])
-    fed_credit = round_currency(fed_bpa * Decimal("0.15"))
+    fed_credit = round_currency(fed_bpa * _get_federal_credit_rate())
     annual_fed_tax = max(round_currency(fed_gross_tax - fed_credit), Decimal("0"))
+    if is_quebec and annual_fed_tax > Decimal("0"):
+        annual_fed_tax, _ = _apply_quebec_abatement(annual_fed_tax)
     period_fed_tax = round_currency(annual_fed_tax / Decimal(str(periods)))
 
     # --- Provincial tax ---
@@ -1679,18 +1839,53 @@ def compute_total_payroll_deductions(conn, args):
 
 def ca_payroll_summary(conn, args):
     """Generate a payroll summary for all employees of a Canadian company."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
-    if not args.month or not args.year:
-        err("--month and --year are required")
+    year, month = _validate_report_year_month(args)
 
     company_id = company["id"]
     company_province = _get_company_province(conn, company)
-    periods = int(args.pay_periods or 12)
+    if not company_province:
+        err("Company province is not configured. Set it with ca-setup-gst-hst --province <code> before running ca-payroll-summary.")
+    raw_periods = getattr(args, "pay_periods", None)
+    if raw_periods is None or (isinstance(raw_periods, str) and raw_periods.strip() == ""):
+        periods = 12
+    else:
+        try:
+            periods = int(str(raw_periods).strip())
+        except (TypeError, ValueError):
+            err("--pay-periods must be 12 for the monthly payroll summary.")
+        if periods != 12:
+            err("--pay-periods must be 12 for the monthly payroll summary.")
+    pay_period_arg = getattr(args, "pay_period", None)
+    if pay_period_arg:
+        if str(pay_period_arg).lower() not in ("monthly", "12"):
+            err("--pay-period must be monthly for the monthly payroll summary.")
+    periods = 12
 
+    _BONUS_NOTE = ("Every slip in the month, including a one-off bonus, "
+                   "is annualised by 12; "
+                   "this approximates the CRA bonus method.")
     _emp = Table("employee")
     _emp_q = Q.from_(_emp).select(_emp.star).where((_emp.company_id == P()) & (_emp.status == P()))
-    employees = conn.execute(_emp_q.get_sql(), (company_id, "active")).fetchall()
+    active_rows = conn.execute(_emp_q.get_sql(), (company_id, "active")).fetchall()
+    # Leavers paid in the month are in PD7A, so they belong in the summary
+    # too: union the active roster with everyone holding a month slip.
+    month_slips = _month_slips(conn, company_id, year, month)
+    slip_ids = {slip.get("employee_id") for slip in month_slips
+                if slip.get("employee_id")}
+    active_ids = set()
+    employees = []
+    for emp_row in active_rows:
+        emp = row_to_dict(emp_row)
+        active_ids.add(emp["id"])
+        employees.append(emp_row)
+    for employee_id in sorted(slip_ids - active_ids):
+        _emp_one = Table("employee")
+        _emp_one_q = Q.from_(_emp_one).select(_emp_one.star).where(_emp_one.id == P())
+        extra = conn.execute(_emp_one_q.get_sql(), (employee_id,)).fetchone()
+        if extra is not None:
+            employees.append(extra)
 
     emp_list = []
     totals = {
@@ -1710,19 +1905,9 @@ def ca_payroll_summary(conn, args):
         emp_province = (emp.get("province") or company_province or "ON").upper()
         is_quebec = emp_province == "QC"
 
-        # Look up latest salary slip for the period
-        period_str = f"{args.year}-{int(args.month):02d}"
-        _ss = Table("salary_slip")
-        _ss_q = (Q.from_(_ss).select(_ss.star)
-                 .where((_ss.employee_id == P()) & (_ss.period_start == P()) & (_ss.status == P())))
-        slip = conn.execute(_ss_q.get_sql(), (emp["id"], period_str, "submitted")).fetchone()
-
-        if slip:
-            slip_dict = row_to_dict(slip)
-            gross = to_decimal(str(slip_dict.get("gross_pay", "0")))
-        else:
-            # No salary slip; skip or estimate from 0
-            gross = Decimal("0")
+        # Aggregate every submitted or paid slip of the month: a bonus run
+        # or semi-monthly payroll means more than one slip per employee.
+        gross = _sum_month_gross(_month_slips(conn, company_id, year, month, emp["id"]))
 
         if gross <= Decimal("0"):
             emp_list.append({
@@ -1772,8 +1957,10 @@ def ca_payroll_summary(conn, args):
         fed_data = _get_federal_brackets()
         fed_bpa = to_decimal(fed_data["basic_personal_amount"])
         fed_gt, _, _ = _progressive_tax(annual_gross, fed_data["brackets"])
-        fed_cr = round_currency(fed_bpa * Decimal("0.15"))
+        fed_cr = round_currency(fed_bpa * _get_federal_credit_rate())
         annual_ft = max(round_currency(fed_gt - fed_cr), Decimal("0"))
+        if is_quebec and annual_ft > Decimal("0"):
+            annual_ft, _ = _apply_quebec_abatement(annual_ft)
         period_ft = round_currency(annual_ft / Decimal(str(periods)))
 
         # Provincial tax
@@ -1830,11 +2017,12 @@ def ca_payroll_summary(conn, args):
 
     ok({
         "report": "Canada Payroll Summary",
-        "period": f"{args.year}-{int(args.month):02d}",
+        "period": f"{year}-{month:02d}",
         "company": company.get("name", ""),
         "employee_count": len(emp_list),
         "employees": emp_list,
         "totals": {k: str(round_currency(v)) for k, v in totals.items()},
+        "bonus_note": _BONUS_NOTE,
     })
 
 
@@ -1844,7 +2032,7 @@ def ca_payroll_summary(conn, args):
 
 def generate_gst_hst_return(conn, args):
     """Generate GST/HST return (Form GST34) for a reporting period."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
     period_val = args.period or args.month
     year_val = args.year or args.tax_year
@@ -1861,8 +2049,8 @@ def generate_gst_hst_return(conn, args):
     _si = Table("sales_invoice")
     _si_q = (Q.from_(_si)
              .select(
-                 fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("revenue"),
-                 fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_collected"),
+                 fn.Coalesce(DecimalSum(_si.total_amount), ValueWrapper("0")).as_("revenue"),
+                 fn.Coalesce(DecimalSum(_si.tax_amount), ValueWrapper("0")).as_("tax_collected"),
                  fn.Count("*").as_("invoice_count"))
              .where((_si.company_id == P()) & (_si.status == P())
                     & (_si.posting_date >= P()) & (_si.posting_date < P())))
@@ -1872,7 +2060,7 @@ def generate_gst_hst_return(conn, args):
     _pi2 = Table("purchase_invoice")
     _pi2_q = (Q.from_(_pi2)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_paid"),
+                  fn.Coalesce(DecimalSum(_pi2.tax_amount), ValueWrapper("0")).as_("tax_paid"),
                   fn.Count("*").as_("invoice_count"))
               .where((_pi2.company_id == P()) & (_pi2.status == P())
                      & (_pi2.posting_date >= P()) & (_pi2.posting_date < P())))
@@ -1909,7 +2097,7 @@ def generate_gst_hst_return(conn, args):
 
 def generate_qst_return(conn, args):
     """Generate Quebec Sales Tax (QST) return for a reporting period."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
     period_val = args.period or args.month
     year_val = args.year or args.tax_year
@@ -1931,8 +2119,8 @@ def generate_qst_return(conn, args):
     _si3 = Table("sales_invoice")
     _si3_q = (Q.from_(_si3)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("revenue"),
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_collected"),
+                  fn.Coalesce(DecimalSum(_si3.total_amount), ValueWrapper("0")).as_("revenue"),
+                  fn.Coalesce(DecimalSum(_si3.tax_amount), ValueWrapper("0")).as_("tax_collected"),
                   fn.Count("*").as_("invoice_count"))
               .where((_si3.company_id == P()) & (_si3.status == P())
                      & (_si3.posting_date >= P()) & (_si3.posting_date < P())))
@@ -1942,7 +2130,7 @@ def generate_qst_return(conn, args):
     _pi3 = Table("purchase_invoice")
     _pi3_q = (Q.from_(_pi3)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("tax_paid"),
+                  fn.Coalesce(DecimalSum(_pi3.tax_amount), ValueWrapper("0")).as_("tax_paid"),
                   fn.Count("*").as_("invoice_count"))
               .where((_pi3.company_id == P()) & (_pi3.status == P())
                      & (_pi3.posting_date >= P()) & (_pi3.posting_date < P())))
@@ -1990,23 +2178,32 @@ def generate_t4(conn, args):
     emp_dict = row_to_dict(emp)
 
     year = int(year_val)
-    emp_province = (emp_dict.get("province") or "ON").upper()
+    emp_company_id = emp_dict.get("company_id")
+    if not emp_company_id:
+        err("Employee has no company recorded.")
+    company = _get_company(conn, emp_company_id)
+    _check_ca_company(company)
+    emp_province = (_get_company_province(conn, company) or "").upper()
+    if not emp_province:
+        err("Company province is not configured. Set it with ca-setup-gst-hst --province <code> before running ca-generate-t4.")
     is_quebec = emp_province == "QC"
 
-    # Sum salary slips for the year
-    # raw SQL — LIKE pattern with dynamic year prefix
-    slips = conn.execute(
-        """SELECT COALESCE(SUM(CAST(gross_pay AS NUMERIC)), 0) as total_gross,
-                  COALESCE(SUM(CAST(total_deductions AS NUMERIC)), 0) as total_deductions,
-                  COUNT(*) as slip_count
-           FROM salary_slip
-           WHERE employee_id = ? AND status = 'submitted'
-             AND period_start LIKE ?""",
-        (args.employee_id, f"{year}-%"),
-    ).fetchone()
-
-    total_gross = round_currency(to_decimal(str(slips["total_gross"])))
-    periods = max(slips["slip_count"], 1)
+    # Sum every submitted or paid slip of the year with exact decimals.
+    _ssy = Table("salary_slip")
+    _ssy_q = (Q.from_(_ssy)
+              .select(_ssy.gross_pay)
+              .where((_ssy.employee_id == P())
+                     & ((_ssy.status == P()) | (_ssy.status == P()))
+                     & (_ssy.period_start.like(P()))))
+    slip_rows = conn.execute(
+        _ssy_q.get_sql(),
+        (args.employee_id, "submitted", "paid", "%s-%%" % year)).fetchall()
+    total_gross = Decimal("0")
+    for _r in slip_rows:
+        total_gross += to_decimal(str(row_to_dict(_r).get("gross_pay", "0")))
+    total_gross = round_currency(total_gross)
+    slip_count = len(slip_rows)
+    periods = max(slip_count, 1)
 
     # Estimate deductions based on gross
     annual_gross = total_gross
@@ -2028,8 +2225,10 @@ def generate_t4(conn, args):
 
     fed_data = _get_federal_brackets()
     fed_gt, _, _ = _progressive_tax(annual_gross, fed_data["brackets"])
-    fed_cr = round_currency(to_decimal(fed_data["basic_personal_amount"]) * Decimal("0.15"))
+    fed_cr = round_currency(to_decimal(fed_data["basic_personal_amount"]) * _get_federal_credit_rate())
     income_tax_deducted = max(round_currency(fed_gt - fed_cr), Decimal("0"))
+    if is_quebec and income_tax_deducted > Decimal("0"):
+        income_tax_deducted, _ = _apply_quebec_abatement(income_tax_deducted)
 
     pension_label = "QPP" if is_quebec else "CPP"
     sin_raw = emp_dict.get("sin", "")
@@ -2046,7 +2245,7 @@ def generate_t4(conn, args):
         "box_22_income_tax_deducted": str(income_tax_deducted),
         "box_24_ei_insurable_earnings": str(round_currency(min(annual_gross, ei_max_ins))),
         f"box_26_{pension_label.lower()}_pensionable_earnings": str(round_currency(min(annual_gross, p_max_pe))),
-        "salary_slips_count": slips["slip_count"],
+        "salary_slips_count": slip_count,
     }
     if is_quebec:
         t4["note"] = "Quebec employees also receive RL-1 from Revenu Quebec."
@@ -2126,14 +2325,18 @@ def generate_roe(conn, args):
     }
     reason_desc = reason_map.get(reason_code.upper(), "Unknown")
 
-    # Get insurable earnings from salary slips (last 26 weeks)
+    # Insurable earnings from every submitted or paid slip (paid means the
+    # wages were paid, so it counts the same way as the shared month rule).
     _ss2 = Table("salary_slip")
     _ss2_q = (Q.from_(_ss2)
               .select(_ss2.gross_pay, _ss2.period_start)
-              .where((_ss2.employee_id == P()) & (_ss2.status == P()))
+              .where((_ss2.employee_id == P())
+                     & ((_ss2.status == P()) | (_ss2.status == P())))
               .orderby(_ss2.period_start, order=Order.desc)
               .limit(26))
-    slips = conn.execute(_ss2_q.get_sql(), (args.employee_id, "submitted")).fetchall()
+    slips = conn.execute(
+        _ss2_q.get_sql(),
+        (args.employee_id, "submitted", "paid")).fetchall()
 
     insurable_earnings = []
     total_insurable = Decimal("0")
@@ -2165,51 +2368,58 @@ def generate_roe(conn, args):
 
 def generate_pd7a(conn, args):
     """Generate PD7A Statement of Account for Current Source Deductions (monthly remittance)."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
-    if not args.month or not args.year:
-        err("--month and --year are required")
+    year, month = _validate_report_year_month(args)
 
     company_id = company["id"]
-    month = int(args.month)
-    year = int(args.year)
     period_str = f"{year}-{month:02d}"
+    # Neither the employee table nor the company table carries a province
+    # column; the province of record lives in regional_settings (see
+    # _get_company_province), so every slip is priced at the company rate.
     company_province = _get_company_province(conn, company)
+    if not company_province:
+        err("Company province is not configured. Set it with ca-setup-gst-hst --province <code> before running ca-generate-pd7a.")
+    company_is_quebec = company_province.upper() == "QC"
 
-    # Get all employees with salary slips for this period
-    _ss3 = Table("salary_slip").as_("ss")
-    _e3 = Table("employee").as_("e")
-    _pd7a_q = (Q.from_(_ss3)
-               .left_join(_e3).on(_e3.id == _ss3.employee_id)
-               .select(_ss3.employee_id, _ss3.gross_pay, _e3.province)
-               .where((_ss3.company_id == P()) & (_ss3.status == P())
-                      & (_ss3.period_start == P())))
-    slips = conn.execute(_pd7a_q.get_sql(), (company_id, "submitted", period_str)).fetchall()
+    # The month's slips through the shared helper, so PD7A and the payroll
+    # summary always agree on which slips belong to a month; grouped by
+    # employee with every slip of the month summed into one monthly gross.
+    slips = _month_slips(conn, company_id, year, month)
+    by_employee = {}
+    for slip in slips:
+        by_employee.setdefault(slip.get("employee_id"), Decimal("0"))
+        by_employee[slip.get("employee_id")] += to_decimal(str(slip.get("gross_pay", "0")))
 
     total_cpp_employee = Decimal("0")
     total_cpp_employer = Decimal("0")
     total_ei_employee = Decimal("0")
     total_ei_employer = Decimal("0")
     total_income_tax = Decimal("0")
+    total_qpp_employee = Decimal("0")
+    total_qpp_employer = Decimal("0")
+    total_quebec_provincial = Decimal("0")
+    total_qpip_employee = Decimal("0")
+    total_qpip_employer = Decimal("0")
     employee_count = 0
 
     cpp_rates = _get_cpp_rates()
     ei_rates = _get_ei_rates()
+    qpip_rates = _get_qpip_rates()
     fed_data = _get_federal_brackets()
+    prov_all = _get_provincial_brackets()
     periods = 12  # Monthly
 
-    for slip_row in slips:
-        slip = row_to_dict(slip_row)
-        gross = to_decimal(str(slip.get("gross_pay", "0")))
+    for employee_id, gross in by_employee.items():
         if gross <= Decimal("0"):
             continue
         employee_count += 1
-        emp_province = (slip.get("province") or company_province or "ON").upper()
+        emp_province = company_province.upper()
         is_quebec = emp_province == "QC"
 
         annual_gross = gross * Decimal(str(periods))
 
-        # CPP/QPP
+        # Pension: CPP for non-Quebec (CRA), QPP for Quebec (Revenu Quebec)
         if is_quebec:
             qpp_rates = _get_qpp_rates()
             p_r = to_decimal(qpp_rates["rate"]) / Decimal("100")
@@ -2225,8 +2435,12 @@ def generate_pd7a(conn, args):
         p_earn = max(min(annual_gross, p_max) - p_ex, Decimal("0"))
         ann_p = min(round_currency(p_earn * p_r), p_mc)
         per_p = round_currency(ann_p / Decimal(str(periods)))
-        total_cpp_employee += per_p
-        total_cpp_employer += per_p
+        if is_quebec:
+            total_qpp_employee += per_p
+            total_qpp_employer += per_p
+        else:
+            total_cpp_employee += per_p
+            total_cpp_employer += per_p
 
         # EI
         ei_rk = "quebec_rate" if is_quebec else "rate"
@@ -2240,17 +2454,67 @@ def generate_pd7a(conn, args):
         total_ei_employee += per_ei
         total_ei_employer += round_currency(per_ei * emp_mult)
 
-        # Income tax (federal only for PD7A purposes)
+        # QPIP (Revenu Quebec): Quebec employees only, same EI pattern of
+        # annualise then divide by 12 with half-up rounding at each step.
+        if is_quebec:
+            qpip_er = to_decimal(qpip_rates["employee_rate"]) / Decimal("100")
+            qpip_rr = to_decimal(qpip_rates["employer_rate"]) / Decimal("100")
+            qpip_mie = to_decimal(qpip_rates["max_insurable_earnings"])
+            qpip_max_e = to_decimal(qpip_rates["max_employee_premium"])
+            qpip_max_r = to_decimal(qpip_rates["max_employer_premium"])
+            ann_qpip_e = min(
+                round_currency(min(annual_gross, qpip_mie) * qpip_er),
+                qpip_max_e)
+            ann_qpip_r = min(
+                round_currency(min(annual_gross, qpip_mie) * qpip_rr),
+                qpip_max_r)
+            total_qpip_employee += round_currency(
+                ann_qpip_e / Decimal(str(periods)))
+            total_qpip_employer += round_currency(
+                ann_qpip_r / Decimal(str(periods)))
+
+        # Federal income tax with the Quebec abatement for Quebec employees
         fed_gt, _, _ = _progressive_tax(annual_gross, fed_data["brackets"])
-        fed_cr = round_currency(to_decimal(fed_data["basic_personal_amount"]) * Decimal("0.15"))
+        fed_cr = round_currency(to_decimal(fed_data["basic_personal_amount"]) * _get_federal_credit_rate())
         ann_ft = max(round_currency(fed_gt - fed_cr), Decimal("0"))
+        if is_quebec and ann_ft > Decimal("0"):
+            ann_ft, _ = _apply_quebec_abatement(ann_ft)
         per_ft = round_currency(ann_ft / Decimal(str(periods)))
-        total_income_tax += per_ft
+
+        # Provincial income tax: CRA for non-Quebec, Revenu Quebec for Quebec
+        prov_d = prov_all.get(emp_province, prov_all.get("ON"))
+        prov_bpa = to_decimal(prov_d["basic_personal_amount"])
+        prov_gt, _, _ = _progressive_tax(annual_gross, prov_d["brackets"])
+        prov_lr = to_decimal(prov_d["brackets"][0]["rate"]) / Decimal("100")
+        prov_cr = round_currency(prov_bpa * prov_lr)
+        net_prov = max(round_currency(prov_gt - prov_cr), Decimal("0"))
+        surtax_total = Decimal("0")
+        if prov_d.get("surtax"):
+            st1 = to_decimal(prov_d.get("surtax_threshold_1", "0"))
+            sr1 = to_decimal(prov_d.get("surtax_rate_1", "0")) / Decimal("100")
+            if net_prov > st1:
+                surtax_total += round_currency((net_prov - st1) * sr1)
+            if "surtax_threshold_2" in prov_d:
+                st2 = to_decimal(prov_d["surtax_threshold_2"])
+                sr2 = to_decimal(prov_d.get("surtax_rate_2", "0")) / Decimal("100")
+                if net_prov > st2:
+                    surtax_total += round_currency((net_prov - st2) * sr2)
+        ann_pt = round_currency(net_prov + surtax_total)
+        per_pt = round_currency(ann_pt / Decimal(str(periods)))
+        if is_quebec:
+            total_quebec_provincial += per_pt
+            total_income_tax += per_ft
+        else:
+            total_income_tax += per_ft + per_pt
 
     total_remittance = round_currency(
         total_cpp_employee + total_cpp_employer +
         total_ei_employee + total_ei_employer +
         total_income_tax
+    )
+    revenu_quebec_total = round_currency(
+        total_qpp_employee + total_qpp_employer + total_quebec_provincial
+        + total_qpip_employee + total_qpip_employer
     )
 
     ok({
@@ -2264,8 +2528,17 @@ def generate_pd7a(conn, args):
         "line_4_ei_employer": str(round_currency(total_ei_employer)),
         "line_5_income_tax": str(round_currency(total_income_tax)),
         "total_remittance": str(total_remittance),
+        "revenu_quebec_qpp_employee": str(round_currency(total_qpp_employee)),
+        "revenu_quebec_qpp_employer": str(round_currency(total_qpp_employer)),
+        "revenu_quebec_qpip_employee": str(round_currency(total_qpip_employee)),
+        "revenu_quebec_qpip_employer": str(round_currency(total_qpip_employer)),
+        "revenu_quebec_provincial_tax": str(round_currency(total_quebec_provincial)),
+        "revenu_quebec_total_remittance": str(revenu_quebec_total),
         "due_date": f"15th of following month ({year}-{month + 1:02d}-15)" if month < 12 else f"{year + 1}-01-15",
         "note": "Remit to CRA by the 15th of the month following the deduction. Penalties apply for late remittance.",
+        "bonus_note": ("Every slip in the month, including a one-off bonus, "
+                       "is annualised by 12; "
+                       "this approximates the CRA bonus method."),
     })
 
 
@@ -2275,7 +2548,7 @@ def generate_pd7a(conn, args):
 
 def ca_tax_summary(conn, args):
     """Dashboard: GST/HST collected, ITCs, net GST payable, payroll totals."""
-    company = _get_company(conn, args.company_id)
+    company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
     _check_ca_company(company)
     if not args.from_date or not args.to_date:
         err("--from-date and --to-date are required")
@@ -2286,8 +2559,8 @@ def ca_tax_summary(conn, args):
     _si4 = Table("sales_invoice")
     _si4_q = (Q.from_(_si4)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"),
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_amount\" AS NUMERIC)")), 0).as_("revenue"),
+                  fn.Coalesce(DecimalSum(_si4.tax_amount), ValueWrapper("0")).as_("total"),
+                  fn.Coalesce(DecimalSum(_si4.total_amount), ValueWrapper("0")).as_("revenue"),
                   fn.Count("*").as_("count"))
               .where((_si4.company_id == P()) & (_si4.status == P())
                      & (_si4.posting_date >= P()) & (_si4.posting_date <= P())))
@@ -2297,7 +2570,7 @@ def ca_tax_summary(conn, args):
     _pi4 = Table("purchase_invoice")
     _pi4_q = (Q.from_(_pi4)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"tax_amount\" AS NUMERIC)")), 0).as_("total"),
+                  fn.Coalesce(DecimalSum(_pi4.tax_amount), ValueWrapper("0")).as_("total"),
                   fn.Count("*").as_("count"))
               .where((_pi4.company_id == P()) & (_pi4.status == P())
                      & (_pi4.posting_date >= P()) & (_pi4.posting_date <= P())))
@@ -2307,16 +2580,17 @@ def ca_tax_summary(conn, args):
     gst_paid = round_currency(to_decimal(str(purchase_tax["total"])))
     net_gst = gst_collected - gst_paid
 
-    # Payroll totals (salary slips in the period)
+    # Payroll totals (every submitted or paid slip in the period)
     _ss4 = Table("salary_slip")
     _ss4_q = (Q.from_(_ss4)
               .select(
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"gross_pay\" AS NUMERIC)")), 0).as_("total_gross"),
-                  fn.Coalesce(fn.Sum(LiteralValue("CAST(\"total_deductions\" AS NUMERIC)")), 0).as_("total_deductions"),
+                  fn.Coalesce(DecimalSum(_ss4.gross_pay), ValueWrapper("0")).as_("total_gross"),
+                  fn.Coalesce(DecimalSum(_ss4.total_deductions), ValueWrapper("0")).as_("total_deductions"),
                   fn.Count("*").as_("slip_count"))
-              .where((_ss4.company_id == P()) & (_ss4.status == P())
+              .where((_ss4.company_id == P())
+                     & ((_ss4.status == P()) | (_ss4.status == P()))
                      & (_ss4.period_start >= P()) & (_ss4.period_start <= P())))
-    payroll = conn.execute(_ss4_q.get_sql(), (company_id, "submitted", args.from_date, args.to_date)).fetchone()
+    payroll = conn.execute(_ss4_q.get_sql(), (company_id, "submitted", "paid", args.from_date, args.to_date)).fetchone()
 
     total_payroll_gross = round_currency(to_decimal(str(payroll["total_gross"])))
     total_payroll_ded = round_currency(to_decimal(str(payroll["total_deductions"])))
@@ -2355,7 +2629,7 @@ def available_reports(conn, args):
     ]
 
     if args.company_id:
-        company = _get_company(conn, args.company_id)
+        company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
         ok({"company": company.get("name", ""), "reports": reports, "total": len(reports)})
     else:
         ok({"reports": reports, "total": len(reports)})
@@ -2370,7 +2644,7 @@ def status_action(conn, args):
     }
 
     if args.company_id:
-        company = _get_company(conn, args.company_id)
+        company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
         result["company"] = company.get("name", "")
         result["country"] = company.get("country", "")
         result["province"] = _get_company_province(conn, company)
@@ -2475,6 +2749,7 @@ def main():
 
     # Company
     parser.add_argument("--company-id")
+    parser.add_argument("--company", dest="company_name", default=None)
 
     # Tax
     parser.add_argument("--amount")
@@ -2513,8 +2788,7 @@ def main():
     check_unknown_args(parser, unknown)
     check_input_lengths(args)
 
-    db_path = args.db_path or DEFAULT_DB_PATH
-    ensure_db_exists(db_path)
+    db_path = getattr(args, "db_path", None)   # None unless --db-path was given
     conn = get_connection(db_path)
 
     # Dependency check
@@ -2525,6 +2799,7 @@ def main():
         conn.close()
         sys.exit(1)
 
+    _resolve_company_flag(conn, args)
     try:
         ACTIONS[args.action](conn, args)
     finally:
