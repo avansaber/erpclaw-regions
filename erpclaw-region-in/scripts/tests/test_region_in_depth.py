@@ -21,16 +21,18 @@ information_schema anywhere in this file.
 Findings documented here without fixing (see CHANGES.md):
 - F1 india-generate-einvoice-payload emits empty PrdDesc/HsnCd and Qty 0
   because the core schema has no such columns to read.
-- F2/F3/F5 form16, form24q and tds-return return static
-  zero amounts despite notes claiming salary-slip / withholding sourcing.
+- F2/F3 form16 and form24q are fixed: they read the submitted and paid
+  salary slips per component and report read zeros when no slips exist.
+- F5 tds-return still returns static zero amounts despite its note claiming
+  withholding sourcing.
 - F6 payroll-summary is fixed: it reads the month's salary slips per
   component and refuses when the payroll components were never seeded.
 - F4 india-generate-hsn-summary raises sqlite3.OperationalError
   (no such column: sii.item_name) on the current schema.
 - F7 the seed links every template line to the *Input* GST accounts, even on
   the Sales templates.
-- F8 india-generate-form24q echoes any --quarter verbatim ("Q5") instead of
-  range-checking 1-4 like india-generate-tds-return does.
+- F8 india-generate-form24q is fixed: it range-checks --quarter 1-4 like
+  india-generate-tds-return does instead of echoing any quarter verbatim.
 """
 import json
 import os
@@ -334,6 +336,9 @@ class TestForm16Depth:
     def test_form16_echoes_employee_and_reports_static_zeros(
             self, conn, env):
         eid = _seed_employee(conn, env["company_id"])
+        r0 = call_action(ACTIONS["india-seed-india-payroll"], conn, ns(
+            company_id=env["company_id"]))
+        assert is_ok(r0)
         before = _snapshot(conn)
         r = call_action(ACTIONS["india-generate-form16"], conn, ns(
             employee_id=eid, fiscal_year="2025-26"))
@@ -342,18 +347,18 @@ class TestForm16Depth:
         assert r["fiscal_year"] == "2025-26"
         assert r["employee_name"] == "Asha K"
         assert r["part_a"]["period"] == "April 2025 - March 2026"
-        # F2 (known, not fixed): the note claims salary-slip sourcing but
-        # every amount is a static zero; the schema has no employee PAN
-        # column so employee_pan is always "".
+        # F2 (fixed): amounts are read from the employee's submitted and
+        # paid salary slips; with no slips every amount reads "0.00". The
+        # schema has no employee PAN column so employee_pan is always "".
         assert r["employee_pan"] == ""
         assert r["part_a"]["quarterly_tds"] == {
             "Q1": "0.00", "Q2": "0.00", "Q3": "0.00", "Q4": "0.00"}
-        assert r["part_a"]["total_tds_deposited"] == "0.00"
+        assert r["part_a"]["total_tds_deducted"] == "0.00"
         assert r["part_b"]["gross_salary"] == "0.00"
         assert r["part_b"]["standard_deduction"] == "75000"
         assert r["part_b"]["taxable_income"] == "0.00"
-        assert r["part_b"]["total_tax"] == "0.00"
         assert r["part_b"]["tds_deducted"] == "0.00"
+        assert r["slip_count"] == 0
         assert _snapshot(conn) == before
 
     def test_form16_refuses_unknown_employee(self, conn, env):
@@ -372,6 +377,9 @@ class TestForm24qDepth:
     def test_form24q_echoes_company_and_reports_static_zeros(
             self, conn, env):
         cid = env["company_id"]
+        r0 = call_action(ACTIONS["india-seed-india-payroll"], conn, ns(
+            company_id=cid))
+        assert is_ok(r0)
         before = _snapshot(conn)
         r = call_action(ACTIONS["india-generate-form24q"], conn, ns(
             company_id=cid, quarter="3", year="2025"))
@@ -380,7 +388,8 @@ class TestForm24qDepth:
         assert r["quarter"] == "Q3"
         assert r["fiscal_year"] == "2025-26"
         assert r["company"] == _company_name(conn, cid)
-        # F3 (known, not fixed): deductees and totals are static empties.
+        # F3 (fixed): deductees and totals are read from the quarter's
+        # submitted and paid salary slips; with no slips they read empty.
         assert r["deductees"] == []
         assert r["total_salary_paid"] == "0.00"
         assert r["total_tds_deducted"] == "0.00"
@@ -395,14 +404,13 @@ class TestForm24qDepth:
         assert _snapshot(conn) == before
 
     def test_form24q_accepts_out_of_range_quarter(self, conn, env):
-        # F8 (known, not fixed): unlike india-generate-tds-return, this
-        # action never range-checks --quarter, so "Q5" is echoed back as a
-        # seemingly valid quarter. Pinned as observed, not as correct.
+        # F8 (fixed): like india-generate-tds-return, this action now
+        # range-checks --quarter, so "5" is refused.
         before = _snapshot(conn)
         r = call_action(ACTIONS["india-generate-form24q"], conn, ns(
             company_id=env["company_id"], quarter="5", year="2025"))
-        assert is_ok(r)
-        assert r["quarter"] == "Q5"
+        assert is_error(r)
+        assert r["message"] == "--quarter must be 1-4"
         assert _snapshot(conn) == before
 
 

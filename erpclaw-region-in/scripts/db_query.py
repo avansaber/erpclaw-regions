@@ -1258,6 +1258,65 @@ def _month_slips(conn, company_id, year, month):
     return [row_to_dict(r) for r in conn.execute(q.get_sql(), tuple(params)).fetchall()]
 
 
+def _india_component_ids(conn):
+    needed = ["PF Employee", "ESI Employee", "Professional Tax", "TDS on Salary"]
+    _sc = Table("salary_component")
+    comp_ids = {}
+    missing = []
+    for name in needed:
+        q = Q.from_(_sc).select(_sc.id).where(_sc.name == P())
+        row = conn.execute(q.get_sql(), (name,)).fetchone()
+        if row is None:
+            missing.append(name)
+        else:
+            comp_ids[name] = row["id"]
+    if missing:
+        err(f"India payroll components are not set up: {', '.join(missing)}. Run india-seed-india-payroll first.")
+    return comp_ids
+
+
+def _slip_statutory_deductions(conn, slip_id, comp_ids):
+    _ssd = Table("salary_slip_detail")
+    qd = Q.from_(_ssd).select(_ssd.star).where(_ssd.salary_slip_id == P())
+    pf_employee = Decimal("0")
+    esi_employee = Decimal("0")
+    professional_tax = Decimal("0")
+    tds = Decimal("0")
+    for det in conn.execute(qd.get_sql(), (slip_id,)).fetchall():
+        d = row_to_dict(det)
+        if d.get("component_type") != "deduction":
+            continue
+        det_comp = d.get("salary_component_id")
+        amt = to_decimal(str(d.get("amount", "0")))
+        if det_comp == comp_ids["PF Employee"]:
+            pf_employee += amt
+        elif det_comp == comp_ids["ESI Employee"]:
+            esi_employee += amt
+        elif det_comp == comp_ids["Professional Tax"]:
+            professional_tax += amt
+        elif det_comp == comp_ids["TDS on Salary"]:
+            tds += amt
+    return {
+        "pf_employee": pf_employee,
+        "esi_employee": esi_employee,
+        "professional_tax": professional_tax,
+        "tds": tds,
+    }
+
+
+def _fy_months(start_year, quarter=None):
+    if quarter == 1:
+        return [(start_year, m) for m in (4, 5, 6)]
+    if quarter == 2:
+        return [(start_year, m) for m in (7, 8, 9)]
+    if quarter == 3:
+        return [(start_year, m) for m in (10, 11, 12)]
+    if quarter == 4:
+        return [(start_year + 1, m) for m in (1, 2, 3)]
+    return ([(start_year, m) for m in (4, 5, 6, 7, 8, 9, 10, 11, 12)]
+            + [(start_year + 1, m) for m in (1, 2, 3)])
+
+
 def seed_india_payroll(conn, args):
     """Seed India payroll salary components (PF, ESI, PT, TDS)."""
     company = _get_company(conn, args.company_id, getattr(args, "company_name", None))
@@ -1543,6 +1602,34 @@ def generate_form16(conn, args):
     emp_dict = row_to_dict(emp)
 
     fy = args.fiscal_year  # e.g., "2025-26"
+    _fy_match = re.fullmatch(r"(\d{4})-(\d{2})", fy or "")
+    if _fy_match is None or int(_fy_match.group(2)) != (int(_fy_match.group(1)) + 1) % 100:
+        err(f"Invalid fiscal year: {fy}. Use YYYY-YY, for example 2025-26.")
+    start_year = int(_fy_match.group(1))
+
+    company = _get_company(conn, emp_dict.get("company_id"), None)
+    _check_india_company(company)
+    comp_ids = _india_component_ids(conn)
+    company_id = company["id"]
+    employee_id = emp_dict.get("id")
+
+    quarterly_tds = {}
+    gross_total = Decimal("0")
+    slip_count = 0
+    for _qi in (1, 2, 3, 4):
+        _qtds = Decimal("0")
+        for (_yy, _mm) in _fy_months(start_year, quarter=_qi):
+            for _slip in _month_slips(conn, company_id, _yy, _mm):
+                if _slip.get("employee_id") != employee_id:
+                    continue
+                slip_count += 1
+                gross_total += to_decimal(str(_slip.get("gross_pay", "0")))
+                _qtds += _slip_statutory_deductions(conn, _slip["id"], comp_ids)["tds"]
+        quarterly_tds["Q%d" % _qi] = _qtds
+    total_tds = quarterly_tds["Q1"] + quarterly_tds["Q2"] + quarterly_tds["Q3"] + quarterly_tds["Q4"]
+    taxable = gross_total - Decimal("75000")
+    if taxable < Decimal("0"):
+        taxable = Decimal("0")
 
     ok({
         "report": "Form 16",
@@ -1552,20 +1639,17 @@ def generate_form16(conn, args):
         "part_a": {
             "employer_tan": "",
             "period": f"April {fy[:4]} - March 20{fy[5:]}",
-            "quarterly_tds": {"Q1": "0.00", "Q2": "0.00", "Q3": "0.00", "Q4": "0.00"},
-            "total_tds_deposited": "0.00",
+            "quarterly_tds": {k: str(round_currency(v)) for k, v in quarterly_tds.items()},
+            "total_tds_deducted": str(round_currency(total_tds)),
         },
         "part_b": {
-            "gross_salary": "0.00",
+            "gross_salary": str(round_currency(gross_total)),
             "standard_deduction": "75000",
-            "chapter_vi_a_deductions": "0.00",
-            "taxable_income": "0.00",
-            "tax_on_income": "0.00",
-            "cess": "0.00",
-            "total_tax": "0.00",
-            "tds_deducted": "0.00",
+            "taxable_income": str(round_currency(taxable)),
+            "tds_deducted": str(round_currency(total_tds)),
         },
-        "note": "Form 16 data populated from salary slips and TDS deposits for the fiscal year.",
+        "slip_count": slip_count,
+        "note": "Amounts are read from the employee's submitted and paid salary slips for the fiscal year. TDS deposits are not recorded, so Part A reports TDS deducted.",
     })
 
 
@@ -1574,15 +1658,70 @@ def generate_form24q(conn, args):
     _check_india_company(company)
     if not args.quarter or not args.year:
         err("--quarter and --year are required")
+    try:
+        year = int(args.year)
+    except (TypeError, ValueError):
+        err(f"Invalid year: {args.year}. Use a four-digit integer year.")
+    try:
+        quarter = int(args.quarter)
+    except (TypeError, ValueError):
+        err("--quarter must be 1-4")
+    if quarter not in (1, 2, 3, 4):
+        err("--quarter must be 1-4")
+    comp_ids = _india_component_ids(conn)
+    quarter_dates = {
+        1: (f"{year}-04-01", f"{year}-06-30"),
+        2: (f"{year}-07-01", f"{year}-09-30"),
+        3: (f"{year}-10-01", f"{year}-12-31"),
+        4: (f"{year + 1}-01-01", f"{year + 1}-03-31"),
+    }
+    start_date, end_date = quarter_dates[quarter]
+    company_id = company["id"]
+    _emp = Table("employee")
+    per_emp = {}
+    for (_yy, _mm) in _fy_months(year, quarter=quarter):
+        for _slip in _month_slips(conn, company_id, _yy, _mm):
+            _eid = _slip.get("employee_id")
+            _gross = to_decimal(str(_slip.get("gross_pay", "0")))
+            _tds = _slip_statutory_deductions(conn, _slip["id"], comp_ids)["tds"]
+            _agg = per_emp.get(_eid)
+            if _agg is None:
+                _qe = Q.from_(_emp).select(_emp.star).where(_emp.id == P())
+                _erow = conn.execute(_qe.get_sql(), (_eid,)).fetchone()
+                _ename = row_to_dict(_erow).get("full_name", "") if _erow is not None else ""
+                _agg = per_emp[_eid] = {
+                    "employee_id": _eid,
+                    "employee_name": _ename,
+                    "slip_count": 0,
+                    "salary": Decimal("0"),
+                    "tds": Decimal("0"),
+                }
+            _agg["slip_count"] += 1
+            _agg["salary"] += _gross
+            _agg["tds"] += _tds
+    deductees = sorted(per_emp.values(), key=lambda e: (e["employee_name"], e["employee_id"]))
+    total_salary = Decimal("0")
+    total_tds = Decimal("0")
+    for _e in deductees:
+        total_salary += _e["salary"]
+        total_tds += _e["tds"]
 
     ok({
         "report": "Form 24Q",
-        "quarter": f"Q{args.quarter}",
-        "fiscal_year": f"{args.year}-{int(args.year) + 1 - 2000}",
+        "quarter": f"Q{quarter}",
+        "fiscal_year": f"{year}-{year + 1 - 2000}",
         "company": company.get("name", ""),
-        "deductees": [],
-        "total_salary_paid": "0.00",
-        "total_tds_deducted": "0.00",
+        "start_date": start_date,
+        "end_date": end_date,
+        "deductees": [{
+            "employee_id": e["employee_id"],
+            "employee_name": e["employee_name"],
+            "slip_count": e["slip_count"],
+            "salary_paid": str(round_currency(e["salary"])),
+            "tds_deducted": str(round_currency(e["tds"])),
+        } for e in deductees],
+        "total_salary_paid": str(round_currency(total_salary)),
+        "total_tds_deducted": str(round_currency(total_tds)),
         "note": "Form 24Q quarterly TDS on salary return. Submit via TRACES portal.",
     })
 
@@ -1593,21 +1732,8 @@ def india_payroll_summary(conn, args):
     _check_india_company(company)
     year, month = _validate_report_year_month(args)
     company_id = company["id"]
-    needed = ["PF Employee", "ESI Employee", "Professional Tax", "TDS on Salary"]
-    _sc = Table("salary_component")
-    comp_ids = {}
-    missing = []
-    for name in needed:
-        q = Q.from_(_sc).select(_sc.id).where(_sc.name == P())
-        row = conn.execute(q.get_sql(), (name,)).fetchone()
-        if row is None:
-            missing.append(name)
-        else:
-            comp_ids[name] = row["id"]
-    if missing:
-        err(f"India payroll components are not set up: {', '.join(missing)}. Run india-seed-india-payroll first.")
+    comp_ids = _india_component_ids(conn)
     slips = _month_slips(conn, company_id, year, month)
-    _ssd = Table("salary_slip_detail")
     _emp = Table("employee")
     per_emp = {}
     totals = {
@@ -1622,25 +1748,11 @@ def india_payroll_summary(conn, args):
         slip_id = slip["id"]
         employee_id = slip["employee_id"]
         gross = to_decimal(str(slip.get("gross_pay", "0")))
-        qd = Q.from_(_ssd).select(_ssd.star).where(_ssd.salary_slip_id == P())
-        pf_emp = Decimal("0")
-        esi_emp = Decimal("0")
-        pt = Decimal("0")
-        tds = Decimal("0")
-        for det in conn.execute(qd.get_sql(), (slip_id,)).fetchall():
-            d = row_to_dict(det)
-            if d.get("component_type") != "deduction":
-                continue
-            det_comp = d.get("salary_component_id")
-            amt = to_decimal(str(d.get("amount", "0")))
-            if det_comp == comp_ids["PF Employee"]:
-                pf_emp += amt
-            elif det_comp == comp_ids["ESI Employee"]:
-                esi_emp += amt
-            elif det_comp == comp_ids["Professional Tax"]:
-                pt += amt
-            elif det_comp == comp_ids["TDS on Salary"]:
-                tds += amt
+        _stat = _slip_statutory_deductions(conn, slip_id, comp_ids)
+        pf_emp = _stat["pf_employee"]
+        esi_emp = _stat["esi_employee"]
+        pt = _stat["professional_tax"]
+        tds = _stat["tds"]
         pf_employer = pf_emp
         if esi_emp > Decimal("0"):
             esi_employer = (gross * Decimal("0.0325")).quantize(Decimal("1"), ROUND_HALF_UP)
